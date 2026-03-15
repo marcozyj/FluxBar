@@ -1,0 +1,7 @@
+.build/
+BuildArtifacts/
+
+# Local private build resources
+Resources/
+
+.DS_Store
