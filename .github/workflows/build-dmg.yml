@@ -1,0 +1,41 @@
+name: Build DMG
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-dmg:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build DMG
+        shell: bash
+        run: |
+          chmod +x Scripts/build-local.sh Scripts/build-dmg.sh
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            export FLUXBAR_APP_VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          ./Scripts/build-dmg.sh
+
+      - name: Upload DMG Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FluxBar-dmg-${{ github.sha }}
+          path: BuildArtifacts/DMG/*.dmg
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: BuildArtifacts/DMG/*.dmg
