@@ -64,6 +64,10 @@ struct FluxBarTopStatusView: View {
     }
 
     private var kernelPhaseTitle: String {
+        if runtimeStore.isSwitchingKernelMode {
+            return "切换中"
+        }
+
         switch runtimeStore.kernelStatus.phase {
         case .running:
             return "运行中"
@@ -122,6 +126,10 @@ struct FluxBarTopStatusView: View {
     }
 
     private var statusTone: FluxTone {
+        if runtimeStore.isSwitchingKernelMode {
+            return .accent
+        }
+
         switch runtimeStore.kernelStatus.phase {
         case .running:
             return .positive

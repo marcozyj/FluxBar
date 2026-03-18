@@ -31,6 +31,7 @@ actor ConfigBuilder {
         let outputURL = try outputURL(for: request)
         do {
             try renderedConfiguration.write(to: outputURL, atomically: true, encoding: .utf8)
+            FluxBarConfigCleanupService.pruneManagedYAMLFiles(except: [outputURL], fileManager: fileManager)
         } catch {
             throw ConfigBuilderError.outputWriteFailed(outputURL.path)
         }
@@ -201,17 +202,26 @@ actor ConfigBuilder {
         let allowLAN = overrides.allowLAN ?? boolScalarValue(for: "allow-lan", in: primaryDocument) ?? false
         blocks["allow-lan"] = renderScalarBlock(key: "allow-lan", value: allowLAN ? "true" : "false")
 
-        if let bindAddress = nonEmpty(overrides.bindAddress) ?? scalarValue(for: "bind-address", in: primaryDocument) {
+        if let bindAddress = normalizedNonEmpty(overrides.bindAddress) ?? scalarValue(for: "bind-address", in: primaryDocument) {
             blocks["bind-address"] = renderScalarBlock(key: "bind-address", value: quoteIfNeeded(bindAddress))
         }
 
         let externalController = resolvedExternalController(primaryDocument: primaryDocument, overrides: overrides)
         if let externalController {
-            blocks["external-controller"] = renderScalarBlock(key: "external-controller", value: quoteIfNeeded(externalController))
+            let renderedValue = externalController.isEmpty ? "\"\"" : quoteIfNeeded(externalController)
+            blocks["external-controller"] = renderScalarBlock(key: "external-controller", value: renderedValue)
         }
 
         if let secret = resolvedSecret(primaryDocument: primaryDocument, overrides: overrides) {
             blocks["secret"] = renderScalarBlock(key: "secret", value: quoteIfNeeded(secret))
+        }
+
+        if overrides.externalControllerCORS != nil || primaryDocument.blockMap["external-controller-cors"] != nil {
+            let patchedCORSBlock = patchExternalControllerCORSBlock(
+                existingBlock: primaryDocument.blockMap["external-controller-cors"],
+                overrides: overrides.externalControllerCORS
+            )
+            blocks["external-controller-cors"] = patchedCORSBlock
         }
 
         let logLevel = overrides.logLevel?.rawValue
@@ -297,16 +307,20 @@ actor ConfigBuilder {
         primaryDocument: RawConfigDocument,
         overrides: ConfigBuildOverrides
     ) -> String? {
-        nonEmpty(overrides.externalController)
+        if let enabled = overrides.externalControllerEnabled, enabled == false {
+            return normalizedNonEmpty(overrides.externalController) ?? "127.0.0.1:19090"
+        }
+
+        return normalizedNonEmpty(overrides.externalController)
             ?? scalarValue(for: "external-controller", in: primaryDocument)
-            ?? "127.0.0.1:9090"
+            ?? "127.0.0.1:19090"
     }
 
     private func resolvedSecret(
         primaryDocument: RawConfigDocument,
         overrides: ConfigBuildOverrides
     ) -> String? {
-        nonEmpty(overrides.secret)
+        normalizedNonEmpty(overrides.secret)
             ?? scalarValue(for: "secret", in: primaryDocument)
     }
 
@@ -340,6 +354,30 @@ actor ConfigBuilder {
         }
 
         appendNestedTunLines(from: existingBlock, into: &lines)
+        return lines.joined(separator: "\n")
+    }
+
+    private func patchExternalControllerCORSBlock(
+        existingBlock: RawConfigBlock?,
+        overrides: ConfigExternalControllerCORSOverrides?
+    ) -> String {
+        let allowPrivateNetwork = overrides?.allowPrivateNetwork
+            ?? boolValue(for: "allow-private-network", inNestedBlock: existingBlock)
+            ?? true
+        let allowOrigins = normalizedAllowOrigins(overrides: overrides?.allowOrigins, existingBlock: existingBlock)
+
+        var lines = [
+            "external-controller-cors:",
+            "  allow-private-network: \(allowPrivateNetwork ? "true" : "false")",
+            "  allow-origins:"
+        ]
+
+        if allowOrigins.isEmpty {
+            lines.append("    - \"*\"")
+        } else {
+            lines.append(contentsOf: allowOrigins.map { "    - \(quoteIfNeeded($0))" })
+        }
+
         return lines.joined(separator: "\n")
     }
 
@@ -546,7 +584,7 @@ actor ConfigBuilder {
             return nil
         }
 
-        return block.scalarValue
+        return normalizedNonEmpty(block.scalarValue)
     }
 
     private func intScalarValue(for key: String, in document: RawConfigDocument) -> Int? {
@@ -573,11 +611,34 @@ actor ConfigBuilder {
     }
 
     private func quoteIfNeeded(_ value: String) -> String {
-        if value.contains(":") || value.contains(" ") || value.contains("#") {
-            return "\"\(value.replacingOccurrences(of: "\"", with: "\\\""))\""
+        let normalized = normalizedScalar(value)
+
+        let needsQuotingByPrefix = normalized.hasPrefix("-")
+            || normalized.hasPrefix("?")
+            || normalized.hasPrefix(":")
+            || normalized.hasPrefix("*")
+            || normalized.hasPrefix("&")
+            || normalized.hasPrefix("!")
+            || normalized.hasPrefix("@")
+            || normalized.hasPrefix("`")
+        let needsQuotingByContent = normalized.rangeOfCharacter(
+            from: CharacterSet(charactersIn: ":\n\r\t #{}[],&*!|>'\"%@`")
+        ) != nil
+        let reservedScalars: Set<String> = [
+            "y", "yes", "n", "no", "true", "false", "on", "off", "null", "~"
+        ]
+        let needsQuotingByReservedWord = reservedScalars.contains(normalized.lowercased())
+
+        if needsQuotingByPrefix || needsQuotingByContent || needsQuotingByReservedWord {
+            let escaped = normalized
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            return "\"\(escaped)\""
         }
-        return value
+
+        return normalized
     }
+
 
     private func sanitizedFileName(_ fileName: String) -> String {
         let basename = URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent
@@ -588,14 +649,20 @@ actor ConfigBuilder {
             .joined()
             .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
 
-        return "\(nonEmpty(normalized) ?? "fluxbar-config").\(ext)"
+        return "\(normalizedNonEmpty(normalized) ?? "fluxbar-config").\(ext)"
     }
 
-    private func nonEmpty(_ value: String?) -> String? {
-        guard let value, value.isEmpty == false else {
+    private func normalizedNonEmpty(_ value: String?) -> String? {
+        guard let value else {
             return nil
         }
-        return value
+
+        let normalized = normalizedScalar(value)
+        guard normalized.isEmpty == false else {
+            return nil
+        }
+
+        return normalized
     }
 
     private func nestedScalarValue(for key: String, in block: RawConfigBlock?) -> String? {
@@ -608,7 +675,7 @@ actor ConfigBuilder {
             .first { $0.hasPrefix("\(key):") }
             .map { line in
                 let rawValue = line.dropFirst(key.count + 1).trimmingCharacters(in: .whitespacesAndNewlines)
-                return rawValue.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                return normalizedScalar(rawValue)
             }
     }
 
@@ -665,6 +732,62 @@ actor ConfigBuilder {
         return values.isEmpty ? ["any:53"] : values
     }
 
+    private func normalizedAllowOrigins(overrides: [String]?, existingBlock: RawConfigBlock?) -> [String] {
+        if let overrides {
+            return overrides
+                .map { normalizedScalar($0) }
+                .filter { $0.isEmpty == false }
+        }
+
+        guard let existingBlock else {
+            return []
+        }
+
+        var values: [String] = []
+        var isInAllowOrigins = false
+
+        for line in existingBlock.bodyLines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let indentation = line.prefix { $0 == " " }.count
+
+            if indentation == 2 {
+                isInAllowOrigins = trimmed == "allow-origins:"
+                continue
+            }
+
+            if isInAllowOrigins, indentation > 2, trimmed.hasPrefix("- ") {
+                let value = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                let normalized = normalizedScalar(value)
+                if normalized.isEmpty == false {
+                    values.append(normalized)
+                }
+            }
+        }
+
+        return values
+    }
+
+    private func normalizedScalar(_ value: String) -> String {
+        var result = value.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if result.count >= 2 {
+            let hasDoubleQuotes = result.hasPrefix("\"") && result.hasSuffix("\"")
+            let hasSingleQuotes = result.hasPrefix("'") && result.hasSuffix("'")
+
+            if hasDoubleQuotes || hasSingleQuotes {
+                result.removeFirst()
+                result.removeLast()
+            }
+        }
+
+        result = result
+            .replacingOccurrences(of: "\\\"", with: "\"")
+            .replacingOccurrences(of: "\\\\", with: "\\")
+
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+
     private let managedKeyOrder = [
         "mixed-port",
         "port",
@@ -676,6 +799,7 @@ actor ConfigBuilder {
         "bind-address",
         "external-controller",
         "secret",
+        "external-controller-cors",
         "log-level",
         "ipv6",
         "tun",

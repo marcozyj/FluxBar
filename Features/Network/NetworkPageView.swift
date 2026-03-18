@@ -199,44 +199,23 @@ private struct NetworkConnection: Identifiable {
 }
 
 private enum NetworkControllerLoader {
-    static func makeClient() -> MihomoControllerClient? {
-        guard
-            let configurationURL = FluxBarDefaultConfigurationLocator.locate(),
-            let text = try? String(contentsOf: configurationURL, encoding: .utf8),
-            let controllerAddress = scalarValue(for: "external-controller", in: text),
-            controllerAddress.isEmpty == false,
-            let configuration = try? MihomoControllerConfiguration(
-                controllerAddress: controllerAddress,
-                secret: scalarValue(for: "secret", in: text),
-                preferLoopbackAccess: true
-            )
-        else {
+    static func makeClient(configurationURL: URL?) -> MihomoControllerClient? {
+        guard let context = FluxBarConfigurationSupport.controllerContext(from: configurationURL) else {
             return nil
         }
 
-        return MihomoControllerClient(configuration: configuration)
-    }
-
-    private static func scalarValue(for key: String, in text: String) -> String? {
-        text.split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { line in
-                line.hasPrefix("#") == false && line.hasPrefix("\(key):")
-            }
-            .map { line in
-                let rawValue = line.dropFirst(key.count + 1).trimmingCharacters(in: .whitespacesAndNewlines)
-                return rawValue.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-            }
+        return MihomoControllerClient(configuration: context.configuration)
     }
 }
 
 struct NetworkPageView: View {
+
     @State private var connections: [NetworkConnection] = []
     @State private var searchKeyword = ""
     @State private var selectedProtocol: NetworkProtocolFilter = .all
-    @State private var isRefreshing = false
     @State private var statusText = "等待连接监控"
     @State private var routeStrategyMap = FluxBarRouteStrategyMap(ruleSetStrategies: [:], inlineStrategies: [:])
+    @State private var isSwitchingKernelMode = false
 
     var body: some View {
         ScrollView(showsIndicators: false) {
@@ -246,16 +225,18 @@ struct NetworkPageView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .task {
-            await reloadConnections()
+            await refreshRouteStrategyMap()
+            let stream = await FluxBarRealtimeHub.shared.subscribeConnections()
+            for await snapshot in stream {
+                if Task.isCancelled {
+                    break
+                }
+                await consumeRealtimeConnectionSnapshot(snapshot)
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: fluxBarConfigurationDidRefreshNotification)) { _ in
             Task {
-                await reloadConnections()
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: fluxBarConnectionMonitorDidUpdate)) { _ in
-            Task {
-                await reloadConnections()
+                await refreshRouteStrategyMap()
             }
         }
     }
@@ -445,70 +426,58 @@ struct NetworkPageView: View {
             return
         }
 
-        guard let client = NetworkControllerLoader.makeClient() else {
+        let configurationURL = kernelStatus.configurationURL ?? FluxBarDefaultConfigurationLocator.locate()
+        guard let client = NetworkControllerLoader.makeClient(configurationURL: configurationURL) else {
             statusText = "Controller 未配置"
             return
         }
 
         do {
             try await client.closeAllConnections()
-            await reloadConnections()
         } catch {
             statusText = "关闭失败"
         }
     }
 
-    private func reloadConnections() async {
-        guard isRefreshing == false else {
-            return
-        }
-
-        await MainActor.run {
-            isRefreshing = true
-        }
-
-        defer {
-            Task { @MainActor in
-                isRefreshing = false
-            }
-        }
-
-        let configurationURL = FluxBarDefaultConfigurationLocator.locate()
-        let strategyMap = FluxBarConfigurationSupport.routeStrategyMap(from: configurationURL)
+    private func refreshRouteStrategyMap() async {
         let kernelStatus = await KernelManager.shared.runningStatus()
-        let monitorSnapshot = await FluxBarConnectionMonitor.shared.snapshot()
-
-        let mappedConnections: [NetworkConnection]
-        let nextStatusText: String
-
-        if let client = NetworkControllerLoader.makeClient(),
-           let snapshot = try? await client.fetchConnections() {
-            mappedConnections = snapshot.connections
-                .sorted { lhs, rhs in
-                    let lhsDate = lhs.start ?? .distantPast
-                    let rhsDate = rhs.start ?? .distantPast
-                    return lhsDate > rhsDate
-                }
-                .map { NetworkConnection.make(from: $0, mapping: strategyMap) }
-            nextStatusText = mappedConnections.isEmpty ? "暂无活动连接" : "连接监控运行中"
-        } else if monitorSnapshot.records.isEmpty == false {
-            mappedConnections = monitorSnapshot.records.map { NetworkConnection.make(from: $0.connection, mapping: strategyMap) }
-            nextStatusText = monitorSnapshot.statusMessage
-        } else if kernelStatus.isRunning == false {
-            mappedConnections = []
-            nextStatusText = "内核未运行"
-        } else if NetworkControllerLoader.makeClient() == nil {
-            mappedConnections = []
-            nextStatusText = "Controller 未配置"
-        } else {
-            mappedConnections = []
-            nextStatusText = "连接流暂时不可用"
-        }
+        let configurationURL = kernelStatus.configurationURL ?? FluxBarDefaultConfigurationLocator.locate()
+        let nextMap = FluxBarConfigurationSupport.routeStrategyMap(from: configurationURL)
+        let latestSnapshot = await FluxBarRealtimeHub.shared.latestConnectionSnapshot()
+        let mapped = latestSnapshot.activeConnections
+            .sorted { lhs, rhs in
+                let lhsDate = lhs.connection.start ?? .distantPast
+                let rhsDate = rhs.connection.start ?? .distantPast
+                return lhsDate > rhsDate
+            }
+            .map { NetworkConnection.make(from: $0.connection, mapping: nextMap) }
 
         await MainActor.run {
-            routeStrategyMap = strategyMap
+            routeStrategyMap = nextMap
+            connections = mapped
+            statusText = latestSnapshot.statusMessage
+        }
+    }
+
+    private func consumeRealtimeConnectionSnapshot(_ snapshot: RealtimeConnectionSnapshot) async {
+        let tunStatus = await TUNManager.shared.currentStatus()
+        let switchingKernelMode = tunStatus.phase == .connecting || tunStatus.phase == .disconnecting || tunStatus.phase == .configuring
+
+        let mappedConnections = snapshot.activeConnections
+            .sorted { lhs, rhs in
+                let lhsDate = lhs.connection.start ?? .distantPast
+                let rhsDate = rhs.connection.start ?? .distantPast
+                return lhsDate > rhsDate
+            }
+            .map { NetworkConnection.make(from: $0.connection, mapping: routeStrategyMap) }
+        let nextStatusText = switchingKernelMode && mappedConnections.isEmpty
+            ? "切换内核模式中"
+            : snapshot.statusMessage
+
+        await MainActor.run {
             connections = mappedConnections
             statusText = nextStatusText
+            isSwitchingKernelMode = switchingKernelMode
         }
     }
 
@@ -517,7 +486,7 @@ struct NetworkPageView: View {
             return "内核尚未运行"
         }
 
-        if statusText == "Controller 未配置" || statusText == "连接流暂时不可用" {
+        if statusText == "Controller 未配置" || statusText == "Controller 未监听" || statusText == "连接流暂时不可用" {
             return "无法读取实时连接"
         }
 
@@ -533,10 +502,18 @@ struct NetworkPageView: View {
             return "当前配置未启用 controller，请先确认 external-controller 已写入配置"
         }
 
+        if statusText == "Controller 未监听" {
+            return "controller 当前不可访问，请检查内核监听状态、端口占用和 secret 配置"
+        }
+
+        if statusText == "切换内核模式中" {
+            return "正在切换 TUN 运行模式，已保留最近一次成功读取到的连接快照"
+        }
+
         if statusText == "连接流暂时不可用" {
             return "controller 暂时没有返回连接流，稍后会自动重试"
         }
 
-        return "请开启系统代理或启用 TUN，让流量真正进入当前内核"
+        return "当前暂无连接；若某些应用未出现在列表中，可能没有走系统代理或 TUN"
     }
 }

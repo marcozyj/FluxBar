@@ -50,6 +50,51 @@ enum FluxBarPreferences {
         if hasValue(for: "settings.systemProxyEnabled") == false {
             set(false, for: "settings.systemProxyEnabled")
         }
+        if hasValue(for: "settings.proxyAutoConfig") == false {
+            set(false, for: "settings.proxyAutoConfig")
+        }
+        if hasValue(for: "settings.proxyHost") == false {
+            set("127.0.0.1", for: "settings.proxyHost")
+        }
+        if hasValue(for: "settings.enableProxyGuard") == false {
+            set(false, for: "settings.enableProxyGuard")
+        }
+        if hasValue(for: "settings.proxyGuardDuration") == false {
+            set("30", for: "settings.proxyGuardDuration")
+        }
+        if hasValue(for: "settings.useDefaultBypass") == false {
+            set(true, for: "settings.useDefaultBypass")
+        }
+        if hasValue(for: "settings.systemProxyBypass") == false {
+            set("", for: "settings.systemProxyBypass")
+        }
+        if hasValue(for: "settings.autoCloseConnections") == false {
+            set(true, for: "settings.autoCloseConnections")
+        }
+        if hasValue(for: "settings.pacFileContent") == false {
+            set(SystemProxyProfile.defaultPACTemplate, for: "settings.pacFileContent")
+        }
+        if hasValue(for: "settings.enableExternalController") == false {
+            set(false, for: "settings.enableExternalController")
+        }
+        if hasValue(for: "settings.externalControllerAddress") == false {
+            set("127.0.0.1:19090", for: "settings.externalControllerAddress")
+        }
+        if hasValue(for: "settings.externalControllerSecret") == false {
+            set("", for: "settings.externalControllerSecret")
+        }
+        if hasValue(for: "settings.externalControllerAllowPrivateNetwork") == false {
+            set(true, for: "settings.externalControllerAllowPrivateNetwork")
+        }
+        if hasValue(for: "settings.externalControllerAllowOrigins") == false {
+            set("", for: "settings.externalControllerAllowOrigins")
+        }
+        if hasValue(for: "settings.webUIList") == false {
+            set(
+                "https://metacubex.github.io/metacubexd/#/setup?http=true&hostname=%host&port=%port&secret=%secret\nhttps://yacd.metacubex.one/?hostname=%host&port=%port&secret=%secret\nhttps://board.zash.run.place/#/setup?http=true&hostname=%host&port=%port&secret=%secret",
+                for: "settings.webUIList"
+            )
+        }
         if hasValue(for: "settings.allowLan") == false {
             set(false, for: "settings.allowLan")
         }

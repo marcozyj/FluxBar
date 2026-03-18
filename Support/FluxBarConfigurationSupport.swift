@@ -54,6 +54,14 @@ struct FluxBarLatencyContext: Sendable {
     let targetURL: String
 }
 
+struct FluxBarControllerContext: Sendable {
+    let controllerAddress: String
+    let secret: String?
+    let configuration: MihomoControllerConfiguration
+    let panelURL: URL?
+    let isExternalUIMounted: Bool
+}
+
 struct FluxBarRouteStrategyMap: Sendable {
     let ruleSetStrategies: [String: String]
     let inlineStrategies: [String: String]
@@ -408,6 +416,34 @@ enum FluxBarConfigurationSupport {
         )
     }
 
+    static func controllerContext(from configurationURL: URL?) -> FluxBarControllerContext? {
+        guard
+            let configurationURL,
+            let text = configurationText(from: configurationURL),
+            let controllerAddress = scalarValue(for: "external-controller", in: text),
+            controllerAddress.isEmpty == false,
+            let configuration = try? MihomoControllerConfiguration(
+                controllerAddress: controllerAddress,
+                secret: scalarValue(for: "secret", in: text),
+                preferLoopbackAccess: true
+            )
+        else {
+            return nil
+        }
+
+        let uiName = scalarValue(for: "external-ui-name", in: text)
+        let panelURL = RuntimeConfigurationInspector.inspect(configurationURL: configurationURL).controller.panelURL
+        let mounted = externalUIIsMounted(configurationURL: configurationURL, externalUIName: uiName)
+
+        return FluxBarControllerContext(
+            controllerAddress: controllerAddress,
+            secret: scalarValue(for: "secret", in: text),
+            configuration: configuration,
+            panelURL: mounted ? panelURL : nil,
+            isExternalUIMounted: mounted
+        )
+    }
+
     static func routeStrategyMap(from configurationURL: URL?) -> FluxBarRouteStrategyMap {
         guard
             let configurationURL,
@@ -463,6 +499,20 @@ enum FluxBarConfigurationSupport {
             ruleSetStrategies: ruleSetStrategies,
             inlineStrategies: inlineStrategies
         )
+    }
+
+    static func externalUIIsMounted(configurationURL: URL?, externalUIName: String?) -> Bool {
+        guard let configurationURL else {
+            return false
+        }
+
+        let uiRoot = configurationURL.deletingLastPathComponent().appendingPathComponent("ui", isDirectory: true)
+        let normalizedName = externalUIName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let expectedURL = normalizedName == "zashboard"
+            ? uiRoot.appendingPathComponent("zashboard", isDirectory: true)
+            : uiRoot
+
+        return FileManager.default.fileExists(atPath: expectedURL.path)
     }
 
     static func strategyGroupCount(from configurationURL: URL?) -> Int {

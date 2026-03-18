@@ -115,7 +115,7 @@ struct FluxBarPopoverContainerView: View {
         HStack {
             Text("◉ MIHOMO v1.19.20")
             Spacer()
-            Text("FluxBar v0.1.0")
+            Text("FluxBar v0.1.1")
         }
         .font(.system(size: 12, weight: .semibold))
         .foregroundStyle(FluxTheme.textSecondary)

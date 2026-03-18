@@ -51,6 +51,7 @@ actor FluxBarFirstLaunchCoordinator {
                             stack: tunStack,
                             autoRoute: runtimeConfiguration.tun.autoRoute,
                             autoDetectInterface: runtimeConfiguration.tun.autoDetectInterface,
+                            strictRoute: runtimeConfiguration.tun.strictRoute,
                             dnsHijack: nil
                         )
                     )

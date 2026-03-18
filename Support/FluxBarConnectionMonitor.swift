@@ -82,13 +82,14 @@ actor FluxBarConnectionMonitor {
         guard kernelStatus.isRunning else {
             pruneExpiredRecords(referenceDate: Date())
             activeConnectionCount = 0
-            statusMessage = "内核未运行"
+            statusMessage = kernelStatus.message ?? "内核未运行"
             updatedAt = Date()
             await publishUpdate()
             return
         }
 
-        guard let client = makeClient() else {
+        let configurationURL = kernelStatus.configurationURL ?? FluxBarDefaultConfigurationLocator.locate()
+        guard let context = FluxBarConfigurationSupport.controllerContext(from: configurationURL) else {
             pruneExpiredRecords(referenceDate: Date())
             activeConnectionCount = 0
             statusMessage = "Controller 未配置"
@@ -96,6 +97,8 @@ actor FluxBarConnectionMonitor {
             await publishUpdate()
             return
         }
+
+        let client = MihomoControllerClient(configuration: context.configuration)
 
         do {
             let snapshot = try await client.fetchConnections()
@@ -123,41 +126,11 @@ actor FluxBarConnectionMonitor {
             await publishUpdate()
         } catch {
             pruneExpiredRecords(referenceDate: Date())
-            activeConnectionCount = 0
-            statusMessage = "连接流读取失败"
+            activeConnectionCount = records.count
+            statusMessage = "Controller 暂时不可用"
             updatedAt = Date()
             await publishUpdate()
         }
-    }
-
-    private func makeClient() -> MihomoControllerClient? {
-        guard
-            let configurationURL = FluxBarDefaultConfigurationLocator.locate(),
-            let text = try? String(contentsOf: configurationURL, encoding: .utf8),
-            let controllerAddress = scalarValue(for: "external-controller", in: text),
-            controllerAddress.isEmpty == false,
-            let configuration = try? MihomoControllerConfiguration(
-                controllerAddress: controllerAddress,
-                secret: scalarValue(for: "secret", in: text),
-                preferLoopbackAccess: true
-            )
-        else {
-            return nil
-        }
-
-        return MihomoControllerClient(configuration: configuration)
-    }
-
-    private func scalarValue(for key: String, in text: String) -> String? {
-        text.split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { line in
-                line.hasPrefix("#") == false && line.hasPrefix("\(key):")
-            }
-            .map { line in
-                let rawValue = line.dropFirst(key.count + 1).trimmingCharacters(in: .whitespacesAndNewlines)
-                return rawValue.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-            }
     }
 
     private func incrementHitCount(for connection: MihomoConnection) {

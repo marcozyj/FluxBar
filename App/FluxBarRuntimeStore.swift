@@ -13,6 +13,7 @@ final class FluxBarRuntimeStore: ObservableObject {
     @Published private(set) var recentOutputCount = 0
     @Published private(set) var lastSyncedAt: Date?
     @Published private(set) var isApplyingTun = false
+    @Published private(set) var isSwitchingKernelMode = false
 
     private var syncTask: Task<Void, Never>?
     private var isRefreshing = false
@@ -64,17 +65,29 @@ final class FluxBarRuntimeStore: ObservableObject {
             refreshRequestedWhileRunning = false
 
             let kernelStatus = await KernelManager.shared.runningStatus()
-            let tunStatus = await TUNManager.shared.refreshStatus()
+            let tunStatus = if isApplyingTun {
+                await TUNManager.shared.currentStatus()
+            } else {
+                await TUNManager.shared.refreshStatus()
+            }
             let recentOutput = await KernelManager.shared.recentOutputLines(for: kernelStatus.kernel)
             let runtimeConfiguration = RuntimeConfigurationInspector.inspect(configurationURL: kernelStatus.configurationURL)
 
+            let shouldPreserveRunningSnapshot =
+                isApplyingTun
+                && self.kernelStatus.isRunning
+                && kernelStatus.phase != .running
+                && kernelStatus.phase != .failed
+
             selectedKernel = kernelStatus.kernel
-            self.kernelStatus = kernelStatus
+            if shouldPreserveRunningSnapshot == false {
+                self.kernelStatus = kernelStatus
+                controllerSnapshot = runtimeConfiguration.controller
+                modeTitle = runtimeConfiguration.modeTitle ?? "未配置"
+                recentOutputCount = recentOutput.count
+            }
             self.tunStatus = tunStatus
             tunConfiguration = runtimeConfiguration.tun
-            controllerSnapshot = runtimeConfiguration.controller
-            modeTitle = runtimeConfiguration.modeTitle ?? "未配置"
-            recentOutputCount = recentOutput.count
             lastSyncedAt = Date()
         } while refreshRequestedWhileRunning
 
@@ -101,7 +114,9 @@ final class FluxBarRuntimeStore: ObservableObject {
         }
 
         isApplyingTun = true
-        tunStatus = tunStatus.transitioning(to: enabled)
+        isSwitchingKernelMode = true
+        let switchingSnapshot = await TUNManager.shared.beginSwitching(to: enabled)
+        tunStatus = switchingSnapshot
 
         do {
             let result = try await FluxBarRuntimeCoordinator.shared.applyTUNChange(
@@ -115,12 +130,14 @@ final class FluxBarRuntimeStore: ObservableObject {
             selectedKernel = result.kernel
             kernelStatus = result.kernelStatus
             tunStatus = result.tunStatus
+            _ = await TUNManager.shared.setExternalStatus(result.tunStatus)
             tunConfiguration = runtimeConfiguration.tun
             controllerSnapshot = runtimeConfiguration.controller
             modeTitle = runtimeConfiguration.modeTitle ?? modeTitle
             recentOutputCount = recentOutput.count
         } catch {
-            tunStatus = TUNStatusSnapshot(
+            await refreshNow()
+            let failedSnapshot = TUNStatusSnapshot(
                 phase: .failed,
                 isEnabled: false,
                 permissionState: .requiresManualSetup,
@@ -130,9 +147,12 @@ final class FluxBarRuntimeStore: ObservableObject {
                 recoveryMessage: "请确认已提供可用配置文件，并且当前使用 mihomo 内核。",
                 needsManualSetup: true
             )
+            tunStatus = failedSnapshot
+            _ = await TUNManager.shared.setExternalStatus(failedSnapshot)
         }
 
         isApplyingTun = false
+        isSwitchingKernelMode = false
         lastSyncedAt = Date()
 
         return tunStatus

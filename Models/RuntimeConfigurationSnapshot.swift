@@ -7,6 +7,8 @@ struct RuntimeControllerSnapshot: Sendable {
     let panelURL: URL?
     let secretConfigured: Bool
     let exposesExternally: Bool
+    let corsAllowPrivateNetwork: Bool?
+    let corsAllowOrigins: [String]
     let statusMessage: String
 
     nonisolated static let unavailable = RuntimeControllerSnapshot(
@@ -16,6 +18,8 @@ struct RuntimeControllerSnapshot: Sendable {
         panelURL: nil,
         secretConfigured: false,
         exposesExternally: false,
+        corsAllowPrivateNetwork: nil,
+        corsAllowOrigins: [],
         statusMessage: "Controller 未配置"
     )
 }
@@ -25,6 +29,8 @@ struct RuntimeTUNSnapshot: Sendable {
     let stack: String?
     let autoRoute: Bool?
     let autoDetectInterface: Bool?
+    let strictRoute: Bool?
+    let dnsHijackValues: [String]
     let dnsHijackCount: Int
     let statusMessage: String
 
@@ -33,6 +39,8 @@ struct RuntimeTUNSnapshot: Sendable {
         stack: nil,
         autoRoute: nil,
         autoDetectInterface: nil,
+        strictRoute: nil,
+        dnsHijackValues: [],
         dnsHijackCount: 0,
         statusMessage: "TUN 未配置"
     )

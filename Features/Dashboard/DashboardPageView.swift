@@ -7,6 +7,19 @@ private enum DashboardMode: String, CaseIterable {
     case direct = "直连"
 }
 
+private enum DashboardPreferences {
+    static let selectedModeKey = "dashboard.selectedMode"
+
+    static func persistedMode() -> DashboardMode {
+        let rawValue = FluxBarPreferences.string(for: selectedModeKey, fallback: DashboardMode.rules.rawValue)
+        return DashboardMode(rawValue: rawValue) ?? .rules
+    }
+
+    static func persistMode(_ mode: DashboardMode) {
+        FluxBarPreferences.set(mode.rawValue, for: selectedModeKey)
+    }
+}
+
 @MainActor
 private enum DashboardSessionState {
     static var didAutoRefreshProviders = false
@@ -1050,10 +1063,10 @@ struct DashboardPageView: View {
     @ObservedObject var summaryStore: FluxBarDashboardSummaryStore
     var onShowToast: (String) -> Void = { _ in }
 
-    @State private var selectedMode: DashboardMode = .rules
-    @State private var systemProxyEnabled = true
-    @State private var didLoadSystemProxyState = false
+    @State private var selectedMode: DashboardMode = DashboardPreferences.persistedMode()
+    @State private var systemProxyEnabled = FluxBarPreferences.bool(for: "settings.systemProxyEnabled", fallback: false)
     @State private var isApplyingSystemProxy = false
+    @State private var pendingSystemProxyTarget: Bool?
     @State private var providers: [DashboardProvider] = []
     @State private var isRefreshingProviders = false
     @State private var activeProviderID: String?
@@ -1107,13 +1120,10 @@ struct DashboardPageView: View {
             }
         }
         .onChange(of: selectedMode) { _, newValue in
+            DashboardPreferences.persistMode(newValue)
             onShowToast("已切换到 \(newValue.rawValue) 模式")
         }
         .onChange(of: systemProxyEnabled) { _, isEnabled in
-            guard didLoadSystemProxyState else {
-                return
-            }
-
             Task {
                 await applySystemProxyChange(isEnabled)
             }
@@ -1125,9 +1135,6 @@ struct DashboardPageView: View {
                 await summaryStore.refreshNow()
             }
 
-            Task {
-                await loadSystemProxyState()
-            }
         }
         .onReceive(NotificationCenter.default.publisher(for: fluxBarConfigurationDidRefreshNotification)) { _ in
             reloadProviders()
@@ -1155,11 +1162,6 @@ struct DashboardPageView: View {
                 await summaryStore.refreshNow()
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: fluxBarConnectionMonitorDidUpdate)) { _ in
-            Task {
-                await summaryStore.refreshNow()
-            }
-        }
     }
 
     private var modeCard: some View {
@@ -1180,32 +1182,42 @@ struct DashboardPageView: View {
                 }
                 .frame(width: proxy.size.width, alignment: .leading)
             }
-            .frame(height: 66)
+            .frame(height: systemProxyRequiresKernelWarning ? 84 : 66)
         }
     }
 
     private var systemProxyPanel: some View {
-        HStack(spacing: 10) {
-            Text("🌐")
-                .font(.system(size: 15))
-                .frame(width: 30, height: 30)
-                .background(.white.opacity(0.84), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .stroke(.white.opacity(0.82), lineWidth: 1)
-                )
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 10) {
+                Text("🌐")
+                    .font(.system(size: 15))
+                    .frame(width: 30, height: 30)
+                    .background(.white.opacity(0.84), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .stroke(.white.opacity(0.82), lineWidth: 1)
+                    )
 
-            Text("系统代理")
-                .font(.system(size: 14, weight: .heavy))
-                .foregroundStyle(FluxTheme.textPrimary)
+                Text("系统代理")
+                    .font(.system(size: 14, weight: .heavy))
+                    .foregroundStyle(FluxTheme.textPrimary)
 
-            Spacer(minLength: 8)
+                Spacer(minLength: 8)
 
-            FluxToggle(isOn: $systemProxyEnabled, isEnabled: isApplyingSystemProxy == false, isLoading: isApplyingSystemProxy)
+                FluxToggle(isOn: $systemProxyEnabled, isEnabled: true, isLoading: isApplyingSystemProxy)
+            }
+
+            if systemProxyRequiresKernelWarning {
+                Text("系统代理已开启，但内核未运行，流量不会被转发")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(FluxTheme.warning)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .frame(height: 66, alignment: .leading)
+        .frame(height: systemProxyRequiresKernelWarning ? 84 : 66, alignment: .leading)
         .background(.white.opacity(0.66), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
@@ -1628,30 +1640,35 @@ struct DashboardPageView: View {
     }
 
     @MainActor
-    private func loadSystemProxyState() async {
-        let configurationURL = runtimeStore.kernelStatus.configurationURL ?? FluxBarDefaultConfigurationLocator.locate()
-        let configuredState = FluxBarPreferences.bool(for: "settings.systemProxyEnabled", fallback: false)
-        let actualState = await SystemProxyManager.shared.currentProxyEnabled(configurationURL: configurationURL)
-        let resolvedState = actualState || configuredState
-
-        systemProxyEnabled = resolvedState
-        didLoadSystemProxyState = true
-    }
-
-    @MainActor
     private func applySystemProxyChange(_ enabled: Bool) async {
+        pendingSystemProxyTarget = enabled
+
         guard isApplyingSystemProxy == false else {
             return
         }
 
         isApplyingSystemProxy = true
+        var latestSummary = "系统代理状态更新中"
+        var latestTarget = enabled
 
-        let configurationURL = runtimeStore.kernelStatus.configurationURL ?? FluxBarDefaultConfigurationLocator.locate()
-        let summary = await SystemProxyManager.shared.applyProxyState(enabled: enabled, configurationURL: configurationURL)
-        FluxBarPreferences.set(enabled, for: "settings.systemProxyEnabled")
+        while let target = pendingSystemProxyTarget {
+            pendingSystemProxyTarget = nil
+            latestTarget = target
+            let configurationURL = runtimeStore.kernelStatus.configurationURL ?? FluxBarDefaultConfigurationLocator.locate()
+            latestSummary = await SystemProxyManager.shared.applyProxyState(enabled: target, configurationURL: configurationURL)
+            FluxBarPreferences.set(target, for: "settings.systemProxyEnabled")
+        }
 
         isApplyingSystemProxy = false
-        onShowToast(summary)
+        if latestTarget && runtimeStore.kernelStatus.isRunning == false {
+            onShowToast("\(latestSummary)，但内核未运行，流量不会被转发")
+        } else {
+            onShowToast(latestSummary)
+        }
+    }
+
+    private var systemProxyRequiresKernelWarning: Bool {
+        systemProxyEnabled && runtimeStore.kernelStatus.isRunning == false && runtimeStore.isSwitchingKernelMode == false
     }
 
     private func presentConfigManagementMenu() {
@@ -1661,14 +1678,14 @@ struct DashboardPageView: View {
         let menu = NSMenu(title: "配置管理")
         menu.autoenablesItems = false
 
-        let currentConfigItem = NSMenuItem(title: "当前配置", action: nil, keyEquivalent: "")
-        let currentConfigSubmenu = NSMenu(title: "当前配置")
+        let currentConfigItem = NSMenuItem(title: "配置文件", action: nil, keyEquivalent: "")
+        let currentConfigSubmenu = NSMenu(title: "配置文件")
 
         if let currentURL = runtimeStore.kernelStatus.configurationURL ?? FluxBarDefaultConfigurationLocator.locate() {
             currentConfigSubmenu.addItem(
-                bridge.item(title: "编辑当前配置") {
+                bridge.item(title: "编辑配置文件") {
                     NSWorkspace.shared.open(currentURL)
-                    onShowToast("已用外部应用打开当前配置")
+                    onShowToast("已用外部应用打开配置文件")
                 }
             )
 
@@ -1677,7 +1694,7 @@ struct DashboardPageView: View {
             currentConfigSubmenu.addItem(
                 bridge.item(title: currentURL.lastPathComponent) {
                     revealInFinder(currentURL)
-                    onShowToast("已定位当前配置")
+                    onShowToast("已定位配置文件")
                 }
             )
         }
@@ -1690,15 +1707,9 @@ struct DashboardPageView: View {
         currentConfigItem.submenu = currentConfigSubmenu
         menu.addItem(currentConfigItem)
 
-        let directoryItem = NSMenuItem(title: "配置目录", action: nil, keyEquivalent: "")
-        let directorySubmenu = NSMenu(title: "配置目录")
-        directorySubmenu.addItem(
-            bridge.item(title: "打开 Configs") {
-                openDirectory { try FluxBarStorageDirectories.configsRoot() }
-            }
-        )
-
-        directoryItem.submenu = directorySubmenu
+        let directoryItem = bridge.item(title: "配置目录") {
+            openDirectory { try FluxBarStorageDirectories.configsRoot() }
+        }
         menu.addItem(directoryItem)
 
         menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)

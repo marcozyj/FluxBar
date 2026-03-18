@@ -119,6 +119,35 @@ struct SettingsPageView: View {
     @State private var updateStatus = "上次检查 11 分钟前"
     @State private var updateSheetPresented = false
     @State private var logsEntryPresented = false
+    @State private var proxyAdvancedPresented = false
+    @State private var externalControllerPresented = false
+    @State private var tunAdvancedPresented = false
+    @State private var systemProxyEnabled = false
+    @State private var proxyAutoConfig = SettingsPersistence.bool(for: "settings.proxyAutoConfig", fallback: false)
+    @State private var proxyHost = SettingsPersistence.string(for: "settings.proxyHost", fallback: "127.0.0.1")
+    @State private var enableProxyGuard = SettingsPersistence.bool(for: "settings.enableProxyGuard", fallback: false)
+    @State private var proxyGuardDuration = SettingsPersistence.string(for: "settings.proxyGuardDuration", fallback: "30")
+    @State private var useDefaultBypass = SettingsPersistence.bool(for: "settings.useDefaultBypass", fallback: true)
+    @State private var proxyBypass = SettingsPersistence.string(for: "settings.systemProxyBypass", fallback: "")
+    @State private var autoCloseConnections = SettingsPersistence.bool(for: "settings.autoCloseConnections", fallback: true)
+    @State private var pacFileContent = SettingsPersistence.string(for: "settings.pacFileContent", fallback: SystemProxyProfile.defaultPACTemplate)
+    @State private var externalControllerEnabled = SettingsPersistence.bool(for: "settings.enableExternalController", fallback: false)
+    @State private var externalControllerAddress = SettingsPersistence.string(for: "settings.externalControllerAddress", fallback: "127.0.0.1:19090")
+    @State private var externalControllerSecret = SettingsPersistence.string(for: "settings.externalControllerSecret", fallback: "")
+    @State private var externalControllerAllowPrivateNetwork = SettingsPersistence.bool(for: "settings.externalControllerAllowPrivateNetwork", fallback: true)
+    @State private var externalControllerAllowOrigins = SettingsPersistence.string(for: "settings.externalControllerAllowOrigins", fallback: "")
+    @State private var webUIList = SettingsPersistence.string(
+        for: "settings.webUIList",
+        fallback: "https://metacubex.github.io/metacubexd/#/setup?http=true&hostname=%host&port=%port&secret=%secret"
+    )
+    @State private var tunStack = ConfigTUNStack.system
+    @State private var tunAutoRoute = true
+    @State private var tunAutoDetectInterface = true
+    @State private var tunStrictRoute = false
+    @State private var tunDNSHijack = "any:53"
+    @State private var isApplyingAdvancedSettings = false
+    @State private var isApplyingProxyProfile = false
+    @State private var isApplyingHelperAction = false
     @State private var kernelVersions: [KernelType: KernelVersionSummary] = Dictionary(
         uniqueKeysWithValues: KernelType.allCases.map { ($0, .placeholder) }
     )
@@ -156,10 +185,41 @@ struct SettingsPageView: View {
             ) {
                 LogsPanelView(onShowToast: onShowToast)
             }
+
+            FluxSheet(
+                isPresented: $proxyAdvancedPresented,
+                title: "系统代理高级"
+            ) {
+                proxyAdvancedContent
+            }
+
+            FluxSheet(
+                isPresented: $externalControllerPresented,
+                title: "外部控制"
+            ) {
+                externalControllerContent
+            }
+
+            FluxSheet(
+                isPresented: $tunAdvancedPresented,
+                title: "TUN 细项"
+            ) {
+                tunAdvancedContent
+            }
         }
         .task {
             syncAutoLaunchState()
+            await refreshSystemProxyState()
+            loadAdvancedSettingsFromRuntime()
             await refreshKernelVersionSummaries(checkLatest: false, announce: false)
+        }
+        .onChange(of: runtimeStore.lastSyncedAt) { _, _ in
+            Task {
+                await refreshSystemProxyState()
+                await MainActor.run {
+                    loadAdvancedSettingsFromRuntime()
+                }
+            }
         }
     }
 
@@ -189,12 +249,46 @@ struct SettingsPageView: View {
 
     private var basicPanel: some View {
         settingGroup {
+            if systemProxyWarningVisible {
+                warningSettingRow(
+                    icon: "🌐",
+                    title: "系统代理已开启",
+                    message: "当前内核未运行，流量不会被转发。"
+                )
+            }
+
             ForEach(basicSettings) { item in
                 if item.key == "tunMode" {
                     tunSettingRow(item)
                 } else {
                     toggleSettingRow(icon: item.icon, title: item.name, subtitle: item.subtitle, toggle: binding(for: item.key, in: $basicSettingsState))
                 }
+            }
+
+            actionSettingRow(
+                icon: "🌐",
+                title: "系统代理高级",
+                subtitle: proxyAutoConfig ? "PAC 模式" : "普通代理模式"
+            ) {
+                Button {
+                    proxyAdvancedPresented = true
+                } label: {
+                    openButtonLabel("配置")
+                }
+                .buttonStyle(.plain)
+            }
+
+            actionSettingRow(
+                icon: "🛠",
+                title: "TUN 细项",
+                subtitle: "stack=\(tunStack.rawValue) · dns-hijack=\(tunDNSHijack)"
+            ) {
+                Button {
+                    tunAdvancedPresented = true
+                } label: {
+                    openButtonLabel("配置")
+                }
+                .buttonStyle(.plain)
             }
 
             quitButton
@@ -486,6 +580,31 @@ struct SettingsPageView: View {
         }
     }
 
+    private func warningSettingRow(icon: String, title: String, message: String) -> some View {
+        HStack(spacing: 12) {
+            sectionIcon(icon)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.system(size: 14, weight: .heavy))
+                    .foregroundStyle(FluxTheme.textPrimary)
+
+                Text(message)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(FluxTheme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 10)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.black.opacity(0.06))
+                .frame(height: 1)
+        }
+    }
+
     private func sectionIcon(_ icon: String) -> some View {
         Text(icon)
             .font(.system(size: 16))
@@ -652,6 +771,221 @@ struct SettingsPageView: View {
                 .foregroundStyle(FluxTheme.textPrimary)
         }
         .padding(.bottom, 2)
+    }
+
+    private var proxyAdvancedContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            advancedToggleRow(title: "PAC 模式", isOn: $proxyAutoConfig)
+            advancedTextFieldRow(title: "代理 Host", text: $proxyHost, placeholder: "127.0.0.1")
+            advancedToggleRow(title: "Proxy Guard", isOn: $enableProxyGuard)
+            advancedTextFieldRow(title: "Guard 间隔(秒)", text: $proxyGuardDuration, placeholder: "30")
+            advancedToggleRow(title: "默认 Bypass", isOn: $useDefaultBypass)
+            advancedTextFieldRow(title: "自定义 Bypass", text: $proxyBypass, placeholder: "localhost,127.0.0.1")
+            advancedToggleRow(title: "关闭代理时断开连接", isOn: $autoCloseConnections)
+            if proxyAutoConfig {
+                advancedTextEditorRow(title: "PAC 模板", text: $pacFileContent)
+            }
+
+            HStack {
+                Spacer(minLength: 0)
+
+                Button {
+                    applySystemProxyAdvancedSettings()
+                } label: {
+                    openButtonLabel(isApplyingProxyProfile ? "应用中" : "保存并应用")
+                }
+                .buttonStyle(.plain)
+                .disabled(isApplyingProxyProfile)
+            }
+            .padding(.top, 6)
+        }
+    }
+
+    private var externalControllerContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            advancedToggleRow(title: "启用外部控制", isOn: $externalControllerEnabled)
+            advancedTextFieldRow(
+                title: "Controller 地址",
+                text: $externalControllerAddress,
+                placeholder: "127.0.0.1:19090",
+                disabled: externalControllerEnabled == false
+            )
+            advancedTextFieldRow(
+                title: "Secret",
+                text: $externalControllerSecret,
+                placeholder: "必填",
+                disabled: externalControllerEnabled == false
+            )
+            advancedToggleRow(
+                title: "CORS allow-private-network",
+                isOn: $externalControllerAllowPrivateNetwork
+            )
+            advancedTextEditorRow(
+                title: "CORS allow-origins（每行一个）",
+                text: $externalControllerAllowOrigins
+            )
+            advancedTextEditorRow(
+                title: "WebUI 列表（每行一个 URL）",
+                text: $webUIList
+            )
+            HStack {
+                Spacer(minLength: 0)
+                Button {
+                    openPreferredWebUI()
+                } label: {
+                    openButtonLabel("打开首选 WebUI")
+                }
+                .buttonStyle(.plain)
+                .disabled(externalControllerEnabled == false)
+            }
+
+            HStack {
+                Spacer(minLength: 0)
+
+                Button {
+                    applyAdvancedRuntimeSettings()
+                } label: {
+                    openButtonLabel(isApplyingAdvancedSettings ? "应用中" : "保存并应用")
+                }
+                .buttonStyle(.plain)
+                .disabled(isApplyingAdvancedSettings)
+            }
+            .padding(.top, 6)
+        }
+    }
+
+    private var tunAdvancedContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Text("TUN Stack")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(FluxTheme.textSecondary)
+
+                Spacer(minLength: 8)
+
+                Menu {
+                    ForEach(ConfigTUNStack.allCases, id: \.self) { stack in
+                        Button(stack.rawValue) {
+                            tunStack = stack
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(tunStack.rawValue)
+                            .font(.system(size: 12, weight: .heavy))
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 10, weight: .bold))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(FluxTheme.elevatedFill, in: Capsule())
+                    .overlay(
+                        Capsule()
+                            .stroke(.white.opacity(0.88), lineWidth: 1)
+                    )
+                }
+                .menuStyle(.borderlessButton)
+            }
+
+            advancedToggleRow(title: "auto-route", isOn: $tunAutoRoute)
+            advancedToggleRow(title: "auto-detect-interface", isOn: $tunAutoDetectInterface)
+            advancedToggleRow(title: "strict-route", isOn: $tunStrictRoute)
+            advancedTextFieldRow(title: "dns-hijack", text: $tunDNSHijack, placeholder: "any:53")
+
+            HStack(spacing: 8) {
+                Button {
+                    installTunHelper()
+                } label: {
+                    openButtonLabel(isApplyingHelperAction ? "处理中" : "安装 Helper")
+                }
+                .buttonStyle(.plain)
+                .disabled(isApplyingHelperAction)
+
+                Button {
+                    uninstallTunHelper()
+                } label: {
+                    openButtonLabel(isApplyingHelperAction ? "处理中" : "卸载 Helper")
+                }
+                .buttonStyle(.plain)
+                .disabled(isApplyingHelperAction)
+            }
+
+            HStack {
+                Text(helperInstalled ? "当前状态：Helper 已安装" : "当前状态：Helper 未安装")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(helperInstalled ? FluxTheme.good : FluxTheme.warning)
+                Spacer(minLength: 0)
+            }
+
+            HStack {
+                Spacer(minLength: 0)
+
+                Button {
+                    applyAdvancedRuntimeSettings()
+                } label: {
+                    openButtonLabel(isApplyingAdvancedSettings ? "应用中" : "保存并应用")
+                }
+                .buttonStyle(.plain)
+                .disabled(isApplyingAdvancedSettings)
+            }
+            .padding(.top, 6)
+        }
+    }
+
+    private var helperInstalled: Bool {
+        PrivilegedTUNHelperService.isInstalled()
+    }
+
+    private func advancedToggleRow(title: String, isOn: Binding<Bool>) -> some View {
+        HStack {
+            Text(title)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(FluxTheme.textSecondary)
+
+            Spacer(minLength: 8)
+            FluxToggle(isOn: isOn)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func advancedTextFieldRow(title: String, text: Binding<String>, placeholder: String, disabled: Bool = false) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(FluxTheme.textSecondary)
+                .frame(width: 160, alignment: .leading)
+
+            TextField(placeholder, text: text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(FluxTheme.elevatedFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(.white.opacity(0.88), lineWidth: 1)
+                )
+                .disabled(disabled)
+                .opacity(disabled ? 0.45 : 1)
+        }
+    }
+
+    private func advancedTextEditorRow(title: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(FluxTheme.textSecondary)
+
+            TextEditor(text: text)
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .frame(minHeight: 96, maxHeight: 140)
+                .padding(8)
+                .background(FluxTheme.elevatedFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(.white.opacity(0.88), lineWidth: 1)
+                )
+        }
     }
 
     private func tunSettingRow(_ item: BasicSetting) -> some View {
@@ -924,6 +1258,241 @@ struct SettingsPageView: View {
         basicSettingsState["autoLaunch"] = OpenAtLoginManager.isEnabled()
     }
 
+    @MainActor
+    private func refreshSystemProxyState() async {
+        let configurationURL = runtimeStore.kernelStatus.configurationURL ?? FluxBarDefaultConfigurationLocator.locate()
+        systemProxyEnabled = await SystemProxyManager.shared.currentProxyEnabled(configurationURL: configurationURL)
+    }
+
+    private func loadAdvancedSettingsFromRuntime() {
+        if let runtimeStack = runtimeStore.tunConfiguration.stack,
+           let parsedStack = ConfigTUNStack(rawValue: runtimeStack) {
+            tunStack = parsedStack
+        }
+        tunAutoRoute = runtimeStore.tunConfiguration.autoRoute ?? true
+        tunAutoDetectInterface = runtimeStore.tunConfiguration.autoDetectInterface ?? true
+        tunStrictRoute = runtimeStore.tunConfiguration.strictRoute ?? false
+        if runtimeStore.tunConfiguration.dnsHijackValues.isEmpty == false {
+            tunDNSHijack = runtimeStore.tunConfiguration.dnsHijackValues.joined(separator: ",")
+        } else {
+            tunDNSHijack = "any:53"
+        }
+
+        let runtimeController = runtimeStore.controllerSnapshot
+        if runtimeController.bindAddress != nil {
+            externalControllerAddress = runtimeController.bindAddress ?? externalControllerAddress
+        }
+        if let secretValue = runtimeController.secretValue {
+            externalControllerSecret = secretValue
+        }
+        externalControllerEnabled = runtimeController.bindAddress?.isEmpty == false
+        if let allowPrivate = runtimeController.corsAllowPrivateNetwork {
+            externalControllerAllowPrivateNetwork = allowPrivate
+        }
+        if runtimeController.corsAllowOrigins.isEmpty == false {
+            externalControllerAllowOrigins = runtimeController.corsAllowOrigins.joined(separator: "\n")
+        }
+    }
+
+    private func applySystemProxyAdvancedSettings() {
+        guard isApplyingProxyProfile == false else {
+            return
+        }
+
+        isApplyingProxyProfile = true
+        let normalizedHost = proxyHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "127.0.0.1"
+            : proxyHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedGuardSeconds = max(5, Int(proxyGuardDuration) ?? 30)
+        let normalizedBypass = proxyBypass.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedPACTemplate = pacFileContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? SystemProxyProfile.defaultPACTemplate
+            : pacFileContent
+
+        SettingsPersistence.set(proxyAutoConfig, for: "settings.proxyAutoConfig")
+        SettingsPersistence.set(normalizedHost, for: "settings.proxyHost")
+        SettingsPersistence.set(enableProxyGuard, for: "settings.enableProxyGuard")
+        SettingsPersistence.set(String(normalizedGuardSeconds), for: "settings.proxyGuardDuration")
+        SettingsPersistence.set(useDefaultBypass, for: "settings.useDefaultBypass")
+        SettingsPersistence.set(normalizedBypass, for: "settings.systemProxyBypass")
+        SettingsPersistence.set(autoCloseConnections, for: "settings.autoCloseConnections")
+        SettingsPersistence.set(normalizedPACTemplate, for: "settings.pacFileContent")
+
+        Task {
+            if systemProxyEnabled == false {
+                await MainActor.run {
+                    proxyHost = normalizedHost
+                    proxyGuardDuration = String(normalizedGuardSeconds)
+                    proxyBypass = normalizedBypass
+                    pacFileContent = normalizedPACTemplate
+                    isApplyingProxyProfile = false
+                    onShowToast("已保存系统代理高级设置（当前代理关闭）")
+                    proxyAdvancedPresented = false
+                }
+                return
+            }
+
+            let configurationURL = runtimeStore.kernelStatus.configurationURL ?? FluxBarDefaultConfigurationLocator.locate()
+            let profile = SystemProxyProfile(
+                enabled: systemProxyEnabled,
+                mode: proxyAutoConfig ? .pac : .manual,
+                proxyHost: normalizedHost,
+                enableGuard: enableProxyGuard,
+                guardIntervalSeconds: normalizedGuardSeconds,
+                useDefaultBypass: useDefaultBypass,
+                customBypass: normalizedBypass,
+                autoCloseConnections: autoCloseConnections,
+                pacTemplate: normalizedPACTemplate
+            )
+            let summary = await SystemProxyManager.shared.applyProxyProfile(profile, configurationURL: configurationURL)
+
+            await MainActor.run {
+                proxyHost = normalizedHost
+                proxyGuardDuration = String(normalizedGuardSeconds)
+                proxyBypass = normalizedBypass
+                pacFileContent = normalizedPACTemplate
+                isApplyingProxyProfile = false
+                onShowToast(summary)
+                proxyAdvancedPresented = false
+            }
+        }
+    }
+
+    private func applyAdvancedRuntimeSettings() {
+        guard isApplyingAdvancedSettings == false else {
+            return
+        }
+
+        isApplyingAdvancedSettings = true
+
+        Task {
+            do {
+                let allowOrigins = externalControllerAllowOrigins
+                    .split(whereSeparator: \.isNewline)
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { $0.isEmpty == false }
+                let dnsHijack = tunDNSHijack
+                    .split(whereSeparator: { ",;\n\r".contains($0) })
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { $0.isEmpty == false }
+                let input = FluxBarAdvancedSettingsInput(
+                    tunEnabled: runtimeStore.tunConfiguration.enabled,
+                    tunStack: tunStack,
+                    tunAutoRoute: tunAutoRoute,
+                    tunAutoDetectInterface: tunAutoDetectInterface,
+                    tunStrictRoute: tunStrictRoute,
+                    tunDNSHijack: dnsHijack.isEmpty ? ["any:53"] : dnsHijack,
+                    externalControllerEnabled: externalControllerEnabled,
+                    externalControllerAddress: externalControllerAddress,
+                    externalControllerSecret: externalControllerSecret,
+                    externalControllerAllowPrivateNetwork: externalControllerAllowPrivateNetwork,
+                    externalControllerAllowOrigins: allowOrigins
+                )
+
+                _ = try await FluxBarSettingsCoordinator.shared.applyAdvancedSettings(input)
+                SettingsPersistence.set(externalControllerEnabled, for: "settings.enableExternalController")
+                SettingsPersistence.set(externalControllerAddress, for: "settings.externalControllerAddress")
+                SettingsPersistence.set(externalControllerSecret, for: "settings.externalControllerSecret")
+                SettingsPersistence.set(externalControllerAllowPrivateNetwork, for: "settings.externalControllerAllowPrivateNetwork")
+                SettingsPersistence.set(allowOrigins.joined(separator: "\n"), for: "settings.externalControllerAllowOrigins")
+                SettingsPersistence.set(webUIList, for: "settings.webUIList")
+
+                await runtimeStore.refreshNow()
+
+                await MainActor.run {
+                    isApplyingAdvancedSettings = false
+                    externalControllerPresented = false
+                    tunAdvancedPresented = false
+                    onShowToast("高级配置已应用")
+                }
+            } catch {
+                await MainActor.run {
+                    isApplyingAdvancedSettings = false
+                    onShowToast(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func installTunHelper() {
+        guard isApplyingHelperAction == false else {
+            return
+        }
+
+        isApplyingHelperAction = true
+        Task {
+            do {
+                try await PrivilegedTUNHelperService.shared.installHelperServiceManually()
+                let refreshed = await TUNManager.shared.refreshStatus()
+                await MainActor.run {
+                    isApplyingHelperAction = false
+                    onShowToast(refreshed.statusMessage)
+                }
+            } catch {
+                await MainActor.run {
+                    isApplyingHelperAction = false
+                    onShowToast(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func uninstallTunHelper() {
+        guard isApplyingHelperAction == false else {
+            return
+        }
+
+        isApplyingHelperAction = true
+        Task {
+            do {
+                if runtimeStore.tunConfiguration.enabled {
+                    _ = await runtimeStore.applyTUNChange(false)
+                }
+                try await PrivilegedTUNHelperService.shared.uninstallHelperService()
+                let refreshed = await TUNManager.shared.refreshStatus()
+                await MainActor.run {
+                    isApplyingHelperAction = false
+                    onShowToast(refreshed.statusMessage)
+                }
+            } catch {
+                await MainActor.run {
+                    isApplyingHelperAction = false
+                    onShowToast(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func openPreferredWebUI() {
+        let templates = webUIList
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.isEmpty == false }
+        guard let template = templates.first else {
+            onShowToast("请先配置 WebUI 列表")
+            return
+        }
+
+        let bindAddress = externalControllerAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hostPort = bindAddress.replacingOccurrences(of: "http://", with: "").replacingOccurrences(of: "https://", with: "")
+        let split = hostPort.split(separator: ":", maxSplits: 1).map(String.init)
+        let host = split.first?.isEmpty == false ? split.first! : "127.0.0.1"
+        let port = split.count > 1 ? split[1] : "9090"
+        let secret = externalControllerSecret.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? externalControllerSecret
+
+        let resolved = template
+            .replacingOccurrences(of: "%host", with: host)
+            .replacingOccurrences(of: "%port", with: port)
+            .replacingOccurrences(of: "%secret", with: secret)
+
+        guard let url = URL(string: resolved) else {
+            onShowToast("WebUI 模板 URL 无效")
+            return
+        }
+
+        NSWorkspace.shared.open(url)
+    }
+
     private func quitFluxBar() {
         guard isQuittingApplication == false else {
             return
@@ -952,6 +1521,10 @@ struct SettingsPageView: View {
                 NSApp.terminate(nil)
             }
         }
+    }
+
+    private var systemProxyWarningVisible: Bool {
+        systemProxyEnabled && runtimeStore.kernelStatus.isRunning == false && runtimeStore.isSwitchingKernelMode == false
     }
 
     private func performMaintenanceAction(_ action: MaintenanceAction) {

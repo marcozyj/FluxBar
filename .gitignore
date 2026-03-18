@@ -3,5 +3,5 @@ BuildArtifacts/
 
 # Local private build resources
 Resources/
-
+test/
 .DS_Store

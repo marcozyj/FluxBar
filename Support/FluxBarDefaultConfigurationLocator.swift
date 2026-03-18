@@ -27,22 +27,18 @@ enum FluxBarDefaultConfigurationLocator {
             return []
         }
 
+        FluxBarConfigCleanupService.pruneManagedYAMLFiles(fileManager: fileManager)
+
         let sourceCandidates = unique(
             bundledConfigCandidates(fileManager: fileManager) +
             workspaceConfigCandidates(fileManager: fileManager)
         )
 
-        for sourceURL in sourceCandidates {
+        if let sourceURL = sourceCandidates.first {
             let destinationURL = configsRoot.appendingPathComponent(sourceURL.lastPathComponent, isDirectory: false)
 
-            guard fileManager.fileExists(atPath: destinationURL.path) == false else {
-                continue
-            }
-
-            do {
-                try fileManager.copyItem(at: sourceURL, to: destinationURL)
-            } catch {
-                continue
+            if fileManager.fileExists(atPath: destinationURL.path) == false {
+                try? fileManager.copyItem(at: sourceURL, to: destinationURL)
             }
         }
 

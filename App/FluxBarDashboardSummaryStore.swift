@@ -10,18 +10,22 @@ final class FluxBarDashboardSummaryStore: ObservableObject {
     @Published private(set) var uploadTotalText = "累计 --"
     @Published private(set) var downloadTotalText = "累计 --"
 
-    private var syncTask: Task<Void, Never>?
+    private var metadataTask: Task<Void, Never>?
+    private var trafficTask: Task<Void, Never>?
+    private var connectionTask: Task<Void, Never>?
 
     deinit {
-        syncTask?.cancel()
+        metadataTask?.cancel()
+        trafficTask?.cancel()
+        connectionTask?.cancel()
     }
 
     func startSyncLoop() {
-        guard syncTask == nil else {
+        guard metadataTask == nil else {
             return
         }
 
-        syncTask = Task { [weak self] in
+        metadataTask = Task { [weak self] in
             guard let self else {
                 return
             }
@@ -36,76 +40,73 @@ final class FluxBarDashboardSummaryStore: ObservableObject {
                 await self.refreshNow()
             }
         }
+
+        trafficTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+
+            let stream = await FluxBarRealtimeHub.shared.subscribeTraffic()
+            for await snapshot in stream {
+                if Task.isCancelled {
+                    break
+                }
+                await self.consumeTrafficSnapshot(snapshot)
+            }
+        }
+
+        connectionTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+
+            let stream = await FluxBarRealtimeHub.shared.subscribeConnections()
+            for await snapshot in stream {
+                if Task.isCancelled {
+                    break
+                }
+                await self.consumeConnectionSnapshot(snapshot)
+            }
+        }
     }
 
     func stopSyncLoop() {
-        syncTask?.cancel()
-        syncTask = nil
+        metadataTask?.cancel()
+        metadataTask = nil
+        trafficTask?.cancel()
+        trafficTask = nil
+        connectionTask?.cancel()
+        connectionTask = nil
     }
 
     func refreshNow() async {
-        let configurationURL = FluxBarDefaultConfigurationLocator.locate()
-        let nextStrategyGroupCount = FluxBarConfigurationSupport.strategyGroupCount(from: configurationURL)
-
-        let monitorSnapshot = await FluxBarConnectionMonitor.shared.snapshot()
-        var nextActiveConnectionCount = monitorSnapshot.activeConnectionCount
-        var nextUploadRateText = "--"
-        var nextDownloadRateText = "--"
-        var nextUploadTotalText = "累计 --"
-        var nextDownloadTotalText = "累计 --"
-
-        if let context = controllerContext(from: configurationURL),
-           let configuration = try? MihomoControllerConfiguration(
-                controllerAddress: context.controllerAddress,
-                secret: context.secret,
-                preferLoopbackAccess: true
-           ) {
-            let client = MihomoControllerClient(configuration: configuration)
-
-            if let traffic = try? await client.fetchLiveTrafficSnapshot() {
-                nextUploadRateText = Self.trafficRateString(traffic.up)
-                nextDownloadRateText = Self.trafficRateString(traffic.down)
-                nextUploadTotalText = "累计 \(Self.trafficTotalString(traffic.upTotal))"
-                nextDownloadTotalText = "累计 \(Self.trafficTotalString(traffic.downTotal))"
-            }
-
-            if let connections = try? await client.fetchConnections() {
-                nextActiveConnectionCount = connections.connections.count
-            }
-        }
-
-        strategyGroupCount = nextStrategyGroupCount
-        activeConnectionCount = nextActiveConnectionCount
-        uploadRateText = nextUploadRateText
-        downloadRateText = nextDownloadRateText
-        uploadTotalText = nextUploadTotalText
-        downloadTotalText = nextDownloadTotalText
+        let kernelStatus = await KernelManager.shared.runningStatus()
+        let configurationURL = kernelStatus.configurationURL ?? FluxBarDefaultConfigurationLocator.locate()
+        strategyGroupCount = FluxBarConfigurationSupport.strategyGroupCount(from: configurationURL)
     }
 
-    private func controllerContext(from configurationURL: URL?) -> (controllerAddress: String, secret: String?)? {
-        guard
-            let configurationURL,
-            let text = try? String(contentsOf: configurationURL, encoding: .utf8),
-            let controllerAddress = scalarValue(for: "external-controller", in: text),
-            controllerAddress.isEmpty == false
-        else {
-            return nil
+    private func consumeTrafficSnapshot(_ snapshot: RealtimeTrafficSnapshot) async {
+        if snapshot.updatedAt == nil || snapshot.statusMessage.contains("未运行") || snapshot.statusMessage.contains("未配置") {
+            uploadRateText = "--"
+            downloadRateText = "--"
+            uploadTotalText = "累计 --"
+            downloadTotalText = "累计 --"
+            return
         }
 
-        return (controllerAddress, scalarValue(for: "secret", in: text))
+        uploadRateText = Self.trafficRateString(snapshot.upBytesPerSecond)
+        downloadRateText = Self.trafficRateString(snapshot.downBytesPerSecond)
+        uploadTotalText = "累计 \(Self.trafficTotalString(snapshot.upTotalBytes))"
+        downloadTotalText = "累计 \(Self.trafficTotalString(snapshot.downTotalBytes))"
     }
 
-    private func scalarValue(for key: String, in text: String) -> String? {
-        text.split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { line in
-                line.hasPrefix("#") == false
-                    && line.hasPrefix("\(key):")
-            }
-            .map { line in
-                let rawValue = line.dropFirst(key.count + 1).trimmingCharacters(in: .whitespacesAndNewlines)
-                return rawValue.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-            }
+    private func consumeConnectionSnapshot(_ snapshot: RealtimeConnectionSnapshot) async {
+        if snapshot.statusMessage.contains("未运行") || snapshot.statusMessage.contains("未配置") {
+            activeConnectionCount = 0
+            return
+        }
+
+        activeConnectionCount = snapshot.activeConnections.count
     }
 
     private static func trafficRateString(_ value: Double) -> String {

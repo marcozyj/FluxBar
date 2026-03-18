@@ -16,8 +16,11 @@ enum RuntimeConfigurationInspector {
 
         return RuntimeConfigurationSnapshot(
             controller: controllerSnapshot(
+                configurationURL: configurationURL,
                 externalController: externalController,
                 secret: secret,
+                corsAllowPrivateNetwork: corsAllowPrivateNetwork(in: text),
+                corsAllowOrigins: corsAllowOrigins(in: text),
                 externalUIName: scalarValue(for: "external-ui-name", in: text)
             ),
             modeTitle: modeTitle,
@@ -26,8 +29,11 @@ enum RuntimeConfigurationInspector {
     }
 
     private nonisolated static func controllerSnapshot(
+        configurationURL: URL,
         externalController: String?,
         secret: String?,
+        corsAllowPrivateNetwork: Bool?,
+        corsAllowOrigins: [String],
         externalUIName: String?
     ) -> RuntimeControllerSnapshot {
         guard let externalController, externalController.isEmpty == false else {
@@ -40,6 +46,7 @@ enum RuntimeConfigurationInspector {
 
         let accessAddress: String?
         let panelURL: URL?
+        let isMounted = FluxBarConfigurationSupport.externalUIIsMounted(configurationURL: configurationURL, externalUIName: externalUIName)
         if let configuration = try? MihomoControllerConfiguration(
             controllerAddress: externalController,
             secret: trimmedSecret,
@@ -48,11 +55,11 @@ enum RuntimeConfigurationInspector {
             let host = configuration.apiBaseURL.host(percentEncoded: false) ?? ""
             let port = configuration.apiBaseURL.port.map(String.init) ?? ""
             accessAddress = port.isEmpty ? host : "\(host):\(port)"
-            panelURL = buildPanelURL(
+            panelURL = isMounted ? buildPanelURL(
                 apiBaseURL: configuration.apiBaseURL,
                 externalUIName: externalUIName,
                 secret: trimmedSecret
-            )
+            ) : nil
         } else {
             accessAddress = nil
             panelURL = nil
@@ -77,6 +84,8 @@ enum RuntimeConfigurationInspector {
             panelURL: panelURL,
             secretConfigured: hasSecret,
             exposesExternally: exposesExternally,
+            corsAllowPrivateNetwork: corsAllowPrivateNetwork,
+            corsAllowOrigins: corsAllowOrigins,
             statusMessage: statusMessage
         )
     }
@@ -180,7 +189,9 @@ enum RuntimeConfigurationInspector {
         let stack = nestedScalarValue(for: "stack", in: tunBlock)
         let autoRoute = nestedScalarValue(for: "auto-route", in: tunBlock).flatMap(parseBool)
         let autoDetectInterface = nestedScalarValue(for: "auto-detect-interface", in: tunBlock).flatMap(parseBool)
-        let dnsHijackCount = nestedListValues(for: "dns-hijack", in: tunBlock).count
+        let strictRoute = nestedScalarValue(for: "strict-route", in: tunBlock).flatMap(parseBool)
+        let dnsHijackValues = nestedListValues(for: "dns-hijack", in: tunBlock)
+        let dnsHijackCount = dnsHijackValues.count
 
         let statusMessage: String
         if enabled {
@@ -195,9 +206,27 @@ enum RuntimeConfigurationInspector {
             stack: stack,
             autoRoute: autoRoute,
             autoDetectInterface: autoDetectInterface,
+            strictRoute: strictRoute,
+            dnsHijackValues: dnsHijackValues,
             dnsHijackCount: dnsHijackCount,
             statusMessage: statusMessage
         )
+    }
+
+    private nonisolated static func corsAllowPrivateNetwork(in text: String) -> Bool? {
+        guard let corsBlock = nestedBlock(named: "external-controller-cors", in: text) else {
+            return nil
+        }
+
+        return nestedScalarValue(for: "allow-private-network", in: corsBlock).flatMap(parseBool)
+    }
+
+    private nonisolated static func corsAllowOrigins(in text: String) -> [String] {
+        guard let corsBlock = nestedBlock(named: "external-controller-cors", in: text) else {
+            return []
+        }
+
+        return nestedListValues(for: "allow-origins", in: corsBlock)
     }
 
     private nonisolated static func nestedBlock(named key: String, in text: String) -> [String]? {
@@ -257,11 +286,31 @@ enum RuntimeConfigurationInspector {
             }
 
             if trimmed.hasPrefix("- ") {
-                values.append(String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines))
+                let rawValue = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                let normalizedValue = normalizeScalar(rawValue)
+                if normalizedValue.isEmpty == false {
+                    values.append(normalizedValue)
+                }
             }
         }
 
         return values
+    }
+
+    private nonisolated static func normalizeScalar(_ value: String) -> String {
+        var result = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard result.count >= 2 else {
+            return result
+        }
+
+        let hasDoubleQuotes = result.hasPrefix("\"") && result.hasSuffix("\"")
+        let hasSingleQuotes = result.hasPrefix("'") && result.hasSuffix("'")
+        if hasDoubleQuotes || hasSingleQuotes {
+            result.removeFirst()
+            result.removeLast()
+        }
+
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private nonisolated static func parseBool(_ value: String) -> Bool? {

@@ -20,6 +20,19 @@ enum ConfigTUNStack: String, Codable, CaseIterable, Sendable {
     case mixed
 }
 
+struct ConfigExternalControllerCORSOverrides: Codable, Sendable {
+    var allowPrivateNetwork: Bool?
+    var allowOrigins: [String]?
+
+    nonisolated init(
+        allowPrivateNetwork: Bool? = nil,
+        allowOrigins: [String]? = nil
+    ) {
+        self.allowPrivateNetwork = allowPrivateNetwork
+        self.allowOrigins = allowOrigins
+    }
+}
+
 struct ConfigTUNOverrides: Codable, Sendable {
     var enabled: Bool?
     var stack: ConfigTUNStack?
@@ -56,8 +69,10 @@ struct ConfigBuildOverrides: Codable, Sendable {
     var bindAddress: String?
     var logLevel: ConfigLogLevel?
     var ipv6: Bool?
+    var externalControllerEnabled: Bool?
     var externalController: String?
     var secret: String?
+    var externalControllerCORS: ConfigExternalControllerCORSOverrides?
     var tunEnabled: Bool?
     var tun: ConfigTUNOverrides?
 
@@ -72,8 +87,10 @@ struct ConfigBuildOverrides: Codable, Sendable {
         bindAddress: String? = nil,
         logLevel: ConfigLogLevel? = nil,
         ipv6: Bool? = nil,
+        externalControllerEnabled: Bool? = nil,
         externalController: String? = nil,
         secret: String? = nil,
+        externalControllerCORS: ConfigExternalControllerCORSOverrides? = nil,
         tunEnabled: Bool? = nil,
         tun: ConfigTUNOverrides? = nil
     ) {
@@ -87,8 +104,10 @@ struct ConfigBuildOverrides: Codable, Sendable {
         self.bindAddress = bindAddress
         self.logLevel = logLevel
         self.ipv6 = ipv6
+        self.externalControllerEnabled = externalControllerEnabled
         self.externalController = externalController
         self.secret = secret
+        self.externalControllerCORS = externalControllerCORS
         self.tunEnabled = tunEnabled
         self.tun = tun
     }

@@ -3,6 +3,7 @@ import SwiftUI
 
 final class FluxBarAppDelegate: NSObject, NSApplicationDelegate {
     private var statusBarController: FluxBarStatusBarController?
+    private var realtimeLogTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -11,14 +12,34 @@ final class FluxBarAppDelegate: NSObject, NSApplicationDelegate {
         Task {
             await FluxBarFirstLaunchCoordinator.shared.bootstrapIfNeeded()
             await FluxBarKernelLifecycleController.shared.bootstrapOnLaunchIfNeeded()
-            if FluxBarPreferences.bool(for: "settings.systemProxyEnabled", fallback: false) {
-                let configurationURL = FluxBarDefaultConfigurationLocator.locate()
-                _ = await SystemProxyManager.shared.applyProxyState(enabled: true, configurationURL: configurationURL)
-            }
             await FluxBarBootstrapCoordinator.shared.bootstrapOnLaunchIfNeeded()
+            await restorePersistedRuntimeState()
         }
-        Task {
-            await FluxBarConnectionMonitor.shared.start()
+        realtimeLogTask = Task {
+            let stream = await FluxBarRealtimeHub.shared.subscribeLogs()
+            for await _ in stream {
+                if Task.isCancelled {
+                    break
+                }
+            }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        realtimeLogTask?.cancel()
+        realtimeLogTask = nil
+    }
+
+    private func restorePersistedRuntimeState() async {
+        let shouldEnableSystemProxy = FluxBarPreferences.bool(for: "settings.systemProxyEnabled", fallback: false)
+        let kernelStatus = await KernelManager.shared.runningStatus()
+        let configurationURL = kernelStatus.configurationURL ?? FluxBarDefaultConfigurationLocator.locate()
+        _ = await SystemProxyManager.shared.applyProxyState(
+            enabled: shouldEnableSystemProxy,
+            configurationURL: configurationURL
+        )
+        if shouldEnableSystemProxy {
+            await SystemProxyManager.shared.refreshGuard()
         }
     }
 }

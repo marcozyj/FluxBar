@@ -1,6 +1,10 @@
 import Foundation
 import SwiftUI
 
+private enum StrategyPagePreferences {
+    static let showHiddenGroupsKey = "strategy.showHiddenGroups"
+}
+
 private enum StrategyGroupKind: String {
     case select = "select"
     case urlTest = "url-test"
@@ -111,7 +115,7 @@ private struct StrategyGroup: Identifiable {
 }
 
 private enum StrategyConfigurationLoader {
-    static func loadGroups() -> [StrategyGroup] {
+    static func loadGroups(showHiddenGroups: Bool = false) -> [StrategyGroup] {
         guard
             let configurationURL = FluxBarDefaultConfigurationLocator.locate(),
             let content = try? String(contentsOf: configurationURL, encoding: .utf8)
@@ -120,7 +124,11 @@ private enum StrategyConfigurationLoader {
         }
 
         let anchorArrays = parseAnchorArrays(from: content)
-        let groups = parseFunctionalGroups(from: content, anchorArrays: anchorArrays)
+        let groups = parseFunctionalGroups(
+            from: content,
+            anchorArrays: anchorArrays,
+            showHiddenGroups: showHiddenGroups
+        )
         return groups.isEmpty ? fallbackGroups : groups
     }
 
@@ -199,7 +207,11 @@ private enum StrategyConfigurationLoader {
         return arrays
     }
 
-    private static func parseFunctionalGroups(from content: String, anchorArrays: [String: [String]]) -> [StrategyGroup] {
+    private static func parseFunctionalGroups(
+        from content: String,
+        anchorArrays: [String: [String]],
+        showHiddenGroups: Bool
+    ) -> [StrategyGroup] {
         let lines = content.components(separatedBy: .newlines)
         var isInProxyGroups = false
         var groups: [StrategyGroup] = []
@@ -220,19 +232,31 @@ private enum StrategyConfigurationLoader {
                 continue
             }
 
-            guard let rawName = field("name", in: body), shouldDisplayGroup(named: rawName) else {
+            guard let rawName = field("name", in: body) else {
                 continue
             }
 
             let alias = field("<<", in: body)?.replacingOccurrences(of: "*", with: "")
             let explicitType = field("type", in: body)?.lowercased()
             let kind = kindFor(alias: alias, explicitType: explicitType)
+            let isHidden = field("hidden", in: body)?.lowercased() == "true"
+            guard
+                shouldDisplayGroup(
+                    named: rawName,
+                    isHidden: isHidden,
+                    kind: kind,
+                    showHiddenGroups: showHiddenGroups
+                )
+            else {
+                continue
+            }
+
             let sourceAlias = field("proxies", in: body)?.replacingOccurrences(of: "*", with: "")
             let filterAlias = field("filter", in: body)?.replacingOccurrences(of: "*", with: "")
             let rawOptions = optionsFor(sourceAlias: sourceAlias, inlineValue: field("proxies", in: body), anchorArrays: anchorArrays)
             let options = rawOptions.map(makeOption(from:))
 
-            guard options.isEmpty == false else {
+            if options.isEmpty, showHiddenGroups == false {
                 continue
             }
 
@@ -257,8 +281,27 @@ private enum StrategyConfigurationLoader {
         return groups
     }
 
-    private static func shouldDisplayGroup(named rawName: String) -> Bool {
-        rawName.contains("默认代理")
+    private static func shouldDisplayGroup(
+        named rawName: String,
+        isHidden: Bool,
+        kind: StrategyGroupKind,
+        showHiddenGroups: Bool
+    ) -> Bool {
+        if showHiddenGroups {
+            if isHidden {
+                return true
+            }
+
+            if kind == .urlTest || kind == .fallback {
+                return true
+            }
+
+            if rawName.contains("自动") || rawName.contains("故转") {
+                return true
+            }
+        }
+
+        return rawName.contains("默认代理")
             || rawName.contains("AIGC")
             || rawName.contains("Steam")
             || rawName.contains("OneDrive")
@@ -658,7 +701,16 @@ private enum StrategyControllerLoader {
 struct StrategyPageView: View {
     var onShowToast: (String) -> Void = { _ in }
 
-    @State private var groups = StrategyConfigurationLoader.loadGroups()
+    @State private var showHiddenGroups = FluxBarPreferences.bool(
+        for: StrategyPagePreferences.showHiddenGroupsKey,
+        fallback: false
+    )
+    @State private var groups = StrategyConfigurationLoader.loadGroups(
+        showHiddenGroups: FluxBarPreferences.bool(
+            for: StrategyPagePreferences.showHiddenGroupsKey,
+            fallback: false
+        )
+    )
     @State private var latencyRevision = 0
     @State private var activeGroupID: String?
     @State private var activeBucket: StrategyOptionBucket = .recommended
@@ -683,16 +735,21 @@ struct StrategyPageView: View {
             ) {
                 VStack(alignment: .leading, spacing: 12) {
                     sheetFilters
-                    sheetOptionsList
+                    ScrollView(showsIndicators: false) {
+                        sheetOptionsList
+                    }
+                    .frame(maxHeight: 560)
                 }
             }
         }
         .task {
+            reloadGroups()
             loadPersistedLatencies()
             await refreshResolvedState(measureLatency: false, announce: false)
         }
         .onReceive(NotificationCenter.default.publisher(for: fluxBarConfigurationDidRefreshNotification)) { _ in
             Task {
+                reloadGroups()
                 loadPersistedLatencies()
                 await refreshResolvedState(measureLatency: false, announce: false)
             }
@@ -715,12 +772,32 @@ struct StrategyPageView: View {
                     )
                     .disabled(isTestingLatency)
 
+                    inlineIconButton(
+                        systemImage: showHiddenGroups ? "eye.fill" : "eye",
+                        isActive: showHiddenGroups,
+                        action: {
+                            toggleHiddenGroupsVisibility()
+                        }
+                    )
+
                     countBadge(groups.count)
                 }
             }
         ) {
             VStack(spacing: 8) {
-                ForEach(groups) { group in
+                ForEach(primaryDisplayGroups) { group in
+                    strategyRow(group)
+                }
+
+                if showHiddenGroupsSeparator {
+                    hiddenGroupDivider
+                }
+
+                ForEach(hiddenAutoDisplayGroups) { group in
+                    strategyRow(group)
+                }
+
+                ForEach(hiddenFallbackDisplayGroups) { group in
                     strategyRow(group)
                 }
             }
@@ -729,25 +806,27 @@ struct StrategyPageView: View {
 
     private var sheetFilters: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(activeGroup?.bucketOrder ?? [], id: \.self) { bucket in
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.18)) {
-                                activeBucket = bucket
+            if shouldFlattenOptionsForActiveGroup == false {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(activeGroup?.bucketOrder ?? [], id: \.self) { bucket in
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    activeBucket = bucket
+                                }
+                            } label: {
+                                Text(bucket.rawValue)
+                                    .font(.system(size: 12, weight: .heavy))
+                                    .foregroundStyle(activeBucket == bucket ? .white : FluxTheme.textPrimary)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(bucketBackground(for: bucket))
                             }
-                        } label: {
-                            Text(bucket.rawValue)
-                                .font(.system(size: 12, weight: .heavy))
-                                .foregroundStyle(activeBucket == bucket ? .white : FluxTheme.textPrimary)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .background(bucketBackground(for: bucket))
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
+                    .padding(.vertical, 1)
                 }
-                .padding(.vertical, 1)
             }
 
             HStack(spacing: 10) {
@@ -840,7 +919,9 @@ struct StrategyPageView: View {
             return []
         }
 
-        let baseOptions = activeGroup.options(in: activeBucket)
+        let baseOptions = shouldFlattenOptionsForActiveGroup
+            ? activeGroup.options
+            : activeGroup.options(in: activeBucket)
         let keyword = searchKeyword.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard keyword.isEmpty == false else {
@@ -853,6 +934,14 @@ struct StrategyPageView: View {
                 || resolvedNodeName(for: option).localizedCaseInsensitiveContains(keyword)
                 || (option.regionLabel?.localizedCaseInsensitiveContains(keyword) ?? false)
         }
+    }
+
+    private var shouldFlattenOptionsForActiveGroup: Bool {
+        guard let activeGroup else {
+            return false
+        }
+
+        return activeGroup.rawName.contains("自动选择") || activeGroup.name.contains("自动选择")
     }
 
     private var sheetBinding: Binding<Bool> {
@@ -920,6 +1009,102 @@ struct StrategyPageView: View {
         activeGroupID = nil
         activeBucket = .recommended
         searchKeyword = ""
+    }
+
+    private func reloadGroups() {
+        let currentSelection = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.currentOptionID) })
+        let previousActiveGroupID = activeGroupID
+        var nextGroups = StrategyConfigurationLoader.loadGroups(showHiddenGroups: showHiddenGroups)
+
+        for index in nextGroups.indices {
+            guard let selectedOptionID = currentSelection[nextGroups[index].id] else {
+                continue
+            }
+
+            if nextGroups[index].options.contains(where: { $0.id == selectedOptionID }) {
+                nextGroups[index].currentOptionID = selectedOptionID
+            }
+        }
+
+        groups = nextGroups
+
+        if let previousActiveGroupID, nextGroups.contains(where: { $0.id == previousActiveGroupID }) {
+            activeGroupID = previousActiveGroupID
+        } else {
+            closeSheet()
+        }
+    }
+
+    private func toggleHiddenGroupsVisibility() {
+        showHiddenGroups.toggle()
+        FluxBarPreferences.set(showHiddenGroups, for: StrategyPagePreferences.showHiddenGroupsKey)
+        reloadGroups()
+        Task {
+            await refreshResolvedState(measureLatency: false, announce: false)
+        }
+        onShowToast(showHiddenGroups ? "已显示隐藏策略组" : "已隐藏自动策略组")
+    }
+
+    private var primaryDisplayGroups: [StrategyGroup] {
+        guard showHiddenGroups else {
+            return groups
+        }
+        return groups.filter { hiddenCategory(for: $0) == nil }
+    }
+
+    private var hiddenAutoDisplayGroups: [StrategyGroup] {
+        guard showHiddenGroups else {
+            return []
+        }
+        return groups.filter { hiddenCategory(for: $0) == .auto }
+    }
+
+    private var hiddenFallbackDisplayGroups: [StrategyGroup] {
+        guard showHiddenGroups else {
+            return []
+        }
+        return groups.filter { hiddenCategory(for: $0) == .fallback }
+    }
+
+    private var showHiddenGroupsSeparator: Bool {
+        hiddenAutoDisplayGroups.isEmpty == false || hiddenFallbackDisplayGroups.isEmpty == false
+    }
+
+    private var hiddenGroupDivider: some View {
+        Rectangle()
+            .fill(Color.black.opacity(0.08))
+            .frame(height: 1)
+            .padding(.vertical, 2)
+    }
+
+    private enum HiddenGroupCategory {
+        case auto
+        case fallback
+    }
+
+    private func hiddenCategory(for group: StrategyGroup) -> HiddenGroupCategory? {
+        let loweredRawName = group.rawName.lowercased()
+        let loweredName = group.name.lowercased()
+
+        if group.kind == .fallback
+            || loweredRawName.contains("故转")
+            || loweredName.contains("故转")
+            || loweredRawName.contains("fallback")
+            || loweredName.contains("fallback") {
+            return .fallback
+        }
+
+        if group.kind == .urlTest
+            || loweredRawName.contains("自动")
+            || loweredName.contains("自动")
+            || loweredRawName.contains("url-test")
+            || loweredName.contains("url-test")
+            || loweredRawName.contains("urltest")
+            || loweredName.contains("urltest") {
+            return .auto
+        }
+
+        return nil
     }
 
     private func runLatencyTest() async {
@@ -1007,6 +1192,12 @@ struct StrategyPageView: View {
                 }
             }
 
+            nextGroups = mergeControllerGroupsIfNeeded(
+                nextGroups,
+                controllerGroups: controllerGroups,
+                groupMap: groupMap
+            )
+
             var nextLeafNames: [String: String] = [:]
             for group in nextGroups {
                 if let currentOption = group.currentOption() {
@@ -1064,6 +1255,130 @@ struct StrategyPageView: View {
                 }
             }
         }
+    }
+
+    private func mergeControllerGroupsIfNeeded(
+        _ source: [StrategyGroup],
+        controllerGroups: [MihomoProxyGroup],
+        groupMap: [String: MihomoProxyGroup]
+    ) -> [StrategyGroup] {
+        guard showHiddenGroups else {
+            return source
+        }
+
+        var result: [StrategyGroup] = source
+
+        for index in result.indices {
+            guard result[index].options.isEmpty, let controllerGroup = groupMap[result[index].rawName] else {
+                continue
+            }
+            result[index] = runtimeStrategyGroup(from: controllerGroup)
+        }
+
+        for controllerGroup in controllerGroups {
+            guard shouldIncludeControllerHiddenGroup(controllerGroup) else {
+                continue
+            }
+
+            guard result.contains(where: { $0.rawName == controllerGroup.name }) == false else {
+                continue
+            }
+
+            result.append(runtimeStrategyGroup(from: controllerGroup))
+        }
+
+        return result.sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private func shouldIncludeControllerHiddenGroup(_ group: MihomoProxyGroup) -> Bool {
+        if group.hidden {
+            return true
+        }
+
+        let loweredType = group.type.lowercased()
+        if loweredType.contains("url-test") || loweredType.contains("urltest") || loweredType.contains("fallback") {
+            return true
+        }
+
+        return group.name.contains("自动") || group.name.contains("故转")
+    }
+
+    private func runtimeStrategyGroup(from group: MihomoProxyGroup) -> StrategyGroup {
+        let options = runtimeStrategyOptions(from: group)
+        let (icon, title) = runtimeSplitLeadingSymbol(group.name)
+        let currentOptionID = options.first(where: { $0.rawName == group.current })?.id
+            ?? options.first?.id
+            ?? group.name
+
+        return StrategyGroup(
+            id: group.name,
+            rawName: group.name,
+            name: title,
+            icon: icon,
+            kind: runtimeKind(from: group.type),
+            sourceAlias: nil,
+            filterAlias: nil,
+            options: options,
+            currentOptionID: currentOptionID
+        )
+    }
+
+    private func runtimeStrategyOptions(from group: MihomoProxyGroup) -> [StrategyOption] {
+        let names = group.all.isEmpty ? [group.current ?? group.name] : group.all
+        return names.map { rawName in
+            let (icon, title) = runtimeSplitLeadingSymbol(rawName)
+            return StrategyOption(
+                id: rawName,
+                rawName: rawName,
+                title: title,
+                icon: icon,
+                bucket: runtimeBucket(for: rawName),
+                regionLabel: nil,
+                modeLabel: "Selector",
+                subtitle: "运行时策略入口",
+                baseLatency: 72
+            )
+        }
+    }
+
+    private func runtimeKind(from rawType: String) -> StrategyGroupKind {
+        let lowered = rawType.lowercased()
+        if lowered.contains("url-test") || lowered.contains("urltest") {
+            return .urlTest
+        }
+        if lowered.contains("fallback") {
+            return .fallback
+        }
+        if lowered.contains("select") {
+            return .select
+        }
+        return .unknown
+    }
+
+    private func runtimeBucket(for rawName: String) -> StrategyOptionBucket {
+        if rawName == "直连" || rawName.contains("自动选择") || rawName.contains("全部节点") {
+            return .recommended
+        }
+        if rawName.contains("故转") {
+            return .fallback
+        }
+        if rawName.contains("自动") {
+            return .auto
+        }
+        if rawName.contains("节点") {
+            return .region
+        }
+        return .other
+    }
+
+    private func runtimeSplitLeadingSymbol(_ rawName: String) -> (String, String) {
+        let parts = rawName.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        if parts.count == 2 {
+            return (String(parts[0]), String(parts[1]))
+        }
+        return ("🌐", rawName)
     }
 
     private func resolvedNodeName(for option: StrategyOption) -> String {
@@ -1242,6 +1557,38 @@ struct StrategyPageView: View {
                     .stroke(.white.opacity(0.88), lineWidth: 1)
             )
             .shadow(color: Color.black.opacity(0.08), radius: 8, y: 4)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func inlineIconButton(systemImage: String, isActive: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(isActive ? Color.white : Color(red: 0.16, green: 0.25, blue: 0.37))
+                .frame(width: 32, height: 32)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(
+                            isActive
+                                ? AnyShapeStyle(FluxTheme.accentFill)
+                                : AnyShapeStyle(
+                                    LinearGradient(
+                                        colors: [
+                                            Color.white.opacity(0.86),
+                                            Color.white.opacity(0.56)
+                                        ],
+                                        startPoint: .top,
+                                        endPoint: .bottom
+                                    )
+                                )
+                        )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(.white.opacity(0.88), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(0.08), radius: 8, y: 4)
         }
         .buttonStyle(.plain)
     }

@@ -36,6 +36,13 @@ actor KernelManager {
     private var lastStartRequests: [KernelType: KernelStartRequest]
     private var statusSnapshots: [KernelType: KernelStatusSnapshot]
     private var recentOutput: [KernelType: [String]]
+    private var controllerHealthCache: [KernelType: (checkedAt: Date, isReachable: Bool, message: String?)]
+
+    private struct ListeningProcessInfo: Sendable {
+        let pid: Int32
+        let port: Int
+        let command: String
+    }
 
     init(
         selectedKernel: KernelType = .mihomo,
@@ -51,6 +58,7 @@ actor KernelManager {
         self.fileManager = fileManager
         self.lastStartRequests = [:]
         self.recentOutput = [:]
+        self.controllerHealthCache = [:]
 
         var runtimeMap: [KernelType: any KernelRuntime] = [:]
         for runtime in runtimes {
@@ -65,21 +73,24 @@ actor KernelManager {
         self.statusSnapshots = snapshots
     }
 
-    func selectKernel(_ kernel: KernelType) -> KernelStatusSnapshot {
+    func selectKernel(_ kernel: KernelType) async -> KernelStatusSnapshot {
         selectedKernel = kernel
-        return runningStatus(for: kernel)
+        return await runningStatus(for: kernel)
     }
 
     func start(_ request: KernelStartRequest) async throws -> KernelStatusSnapshot {
+        if privilegedProcess == nil, let restored = helperBackedProcess(for: request.kernel) {
+            privilegedProcess = restored
+        }
         if let activeProcess, activeProcess.process.isRunning {
             if activeProcess.launchPlan.kernel == request.kernel {
-                return runningStatus(for: request.kernel)
+                return await runningStatus(for: request.kernel)
             }
 
             _ = await stop()
         } else if let privilegedProcess, processExists(privilegedProcess.pid) {
             if privilegedProcess.launchPlan.kernel == request.kernel {
-                return runningStatus(for: request.kernel)
+                return await runningStatus(for: request.kernel)
             }
 
             _ = await stop()
@@ -139,12 +150,37 @@ actor KernelManager {
                     message: "已启动 \(request.kernel.displayName)（TUN/管理员模式）"
                 )
                 statusSnapshots[request.kernel] = runningSnapshot
+                let validatedSnapshot = await validatedRunningSnapshot(from: runningSnapshot, forceRefresh: true)
+                statusSnapshots[request.kernel] = validatedSnapshot
+
+                if validatedSnapshot.phase != .running {
+                    do {
+                        try await stopPrivilegedKernel(privilegedProcess)
+                    } catch {
+                        await FluxBarLogService.shared.record(
+                            source: request.kernel == .mihomo ? .mihomo : .smart,
+                            level: .warning,
+                            message: "管理员模式启动后回滚失败：\(error.localizedDescription)"
+                        )
+                    }
+                    self.privilegedProcess = nil
+                    throw KernelError.launchFailed(request.kernel, underlying: validatedSnapshot.message ?? "controller 不可用")
+                }
+
                 await FluxBarLogService.shared.record(
                     source: request.kernel == .mihomo ? .mihomo : .smart,
                     level: .info,
                     message: "\(request.kernel.displayName) 已以管理员模式启动，PID \(privilegedProcess.pid)"
                 )
-                return runningSnapshot
+                return validatedSnapshot
+            }
+
+            let portReleaseResult = await ensureConfiguredPortsReleased(
+                configurationURL: launchPlan.configurationURL,
+                expectedBinaryURL: launchPlan.binaryURL
+            )
+            if portReleaseResult.isReleased == false {
+                throw KernelError.launchFailed(request.kernel, underlying: portReleaseResult.message ?? "端口占用：9090 或 7890 未释放")
             }
 
             try process.run()
@@ -230,17 +266,35 @@ actor KernelManager {
             message: "已启动 \(request.kernel.displayName)"
         )
         statusSnapshots[request.kernel] = runningSnapshot
+        let validatedSnapshot = await validatedRunningSnapshot(from: runningSnapshot, forceRefresh: true)
+        statusSnapshots[request.kernel] = validatedSnapshot
+
+        if validatedSnapshot.phase != .running {
+            if process.isRunning {
+                process.terminate()
+                _ = await waitForProcessExit(process, checks: 10, intervalNanoseconds: 100_000_000)
+            }
+            activeProcess?.stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            activeProcess?.stderrPipe.fileHandleForReading.readabilityHandler = nil
+            activeProcess = nil
+            throw KernelError.launchFailed(request.kernel, underlying: validatedSnapshot.message ?? "controller 不可用")
+        }
+
         await FluxBarLogService.shared.record(
             source: request.kernel == .mihomo ? .mihomo : .smart,
             level: .info,
             message: "\(request.kernel.displayName) 已启动，PID \(process.processIdentifier)"
         )
 
-        return runningSnapshot
+        return validatedSnapshot
     }
 
     func stop() async -> KernelStatusSnapshot {
         let kernel = activeProcess?.launchPlan.kernel ?? privilegedProcess?.launchPlan.kernel ?? selectedKernel
+
+        if privilegedProcess == nil, let restored = helperBackedProcess(for: kernel) {
+            privilegedProcess = restored
+        }
 
         guard activeProcess != nil || privilegedProcess != nil else {
             let snapshot = KernelStatusSnapshot.idle(for: kernel, message: "内核当前未运行")
@@ -291,6 +345,31 @@ actor KernelManager {
                 return failedSnapshot
             }
 
+            let portReleaseResult = await ensureConfiguredPortsReleased(
+                configurationURL: privilegedProcess.launchPlan.configurationURL,
+                expectedBinaryURL: privilegedProcess.launchPlan.binaryURL
+            )
+            if portReleaseResult.isReleased == false {
+                let failedSnapshot = KernelStatusSnapshot(
+                    kernel: kernel,
+                    phase: .failed,
+                    processIdentifier: nil,
+                    binaryURL: privilegedProcess.launchPlan.binaryURL,
+                    configurationURL: privilegedProcess.launchPlan.configurationURL,
+                    launchedAt: privilegedProcess.launchedAt,
+                    lastExitCode: nil,
+                    message: portReleaseResult.message ?? "端口占用：9090 或 7890 未释放"
+                )
+                statusSnapshots[kernel] = failedSnapshot
+                await FluxBarLogService.shared.record(
+                    source: kernel == .mihomo ? .mihomo : .smart,
+                    level: .error,
+                    message: "\(kernel.displayName) 已停止，但端口未释放：\(portReleaseResult.message ?? "9090/7890")"
+                )
+                self.privilegedProcess = nil
+                return failedSnapshot
+            }
+
             self.privilegedProcess = nil
 
             let stoppedSnapshot = KernelStatusSnapshot(
@@ -336,6 +415,30 @@ actor KernelManager {
         activeProcess.stderrPipe.fileHandleForReading.readabilityHandler = nil
         self.activeProcess = nil
 
+        let portReleaseResult = await ensureConfiguredPortsReleased(
+            configurationURL: activeProcess.launchPlan.configurationURL,
+            expectedBinaryURL: activeProcess.launchPlan.binaryURL
+        )
+        if portReleaseResult.isReleased == false {
+            let failedSnapshot = KernelStatusSnapshot(
+                kernel: kernel,
+                phase: .failed,
+                processIdentifier: nil,
+                binaryURL: activeProcess.launchPlan.binaryURL,
+                configurationURL: activeProcess.launchPlan.configurationURL,
+                launchedAt: nil,
+                lastExitCode: activeProcess.process.terminationStatus,
+                message: portReleaseResult.message ?? "端口占用：9090 或 7890 未释放"
+            )
+            statusSnapshots[kernel] = failedSnapshot
+            await FluxBarLogService.shared.record(
+                source: kernel == .mihomo ? .mihomo : .smart,
+                level: .error,
+                message: "\(kernel.displayName) 已停止，但端口未释放：\(portReleaseResult.message ?? "9090/7890")"
+            )
+            return failedSnapshot
+        }
+
         let stoppedSnapshot = KernelStatusSnapshot(
             kernel: kernel,
             phase: .stopped,
@@ -364,12 +467,51 @@ actor KernelManager {
         return try await start(request)
     }
 
-    func runningStatus(for kernel: KernelType? = nil) -> KernelStatusSnapshot {
+    func hasActiveKernelProcess(for kernel: KernelType? = nil) -> Bool {
         let targetKernel = kernel ?? activeProcess?.launchPlan.kernel ?? privilegedProcess?.launchPlan.kernel ?? selectedKernel
 
         if let activeProcess, activeProcess.launchPlan.kernel == targetKernel, activeProcess.process.isRunning {
+            return true
+        }
+
+        if privilegedProcess == nil, let restored = helperBackedProcess(for: targetKernel) {
+            privilegedProcess = restored
+        }
+
+        if let privilegedProcess, privilegedProcess.launchPlan.kernel == targetKernel, processExists(privilegedProcess.pid) {
+            return true
+        }
+
+        return false
+    }
+
+    func isRunningInPrivilegedMode(for kernel: KernelType? = nil) -> Bool {
+        let targetKernel = kernel ?? activeProcess?.launchPlan.kernel ?? privilegedProcess?.launchPlan.kernel ?? selectedKernel
+
+        if privilegedProcess == nil, let restored = helperBackedProcess(for: targetKernel) {
+            privilegedProcess = restored
+        }
+
+        guard
+            let privilegedProcess,
+            privilegedProcess.launchPlan.kernel == targetKernel
+        else {
+            return false
+        }
+
+        return processExists(privilegedProcess.pid)
+    }
+
+    func runningStatus(for kernel: KernelType? = nil) async -> KernelStatusSnapshot {
+        let targetKernel = kernel ?? activeProcess?.launchPlan.kernel ?? privilegedProcess?.launchPlan.kernel ?? selectedKernel
+
+        if privilegedProcess == nil, let restored = helperBackedProcess(for: targetKernel) {
+            privilegedProcess = restored
+        }
+
+        if let activeProcess, activeProcess.launchPlan.kernel == targetKernel, activeProcess.process.isRunning {
             let current = statusSnapshots[targetKernel]
-            return KernelStatusSnapshot(
+            let snapshot = KernelStatusSnapshot(
                 kernel: targetKernel,
                 phase: .running,
                 processIdentifier: activeProcess.process.processIdentifier,
@@ -379,11 +521,14 @@ actor KernelManager {
                 lastExitCode: nil,
                 message: current?.message ?? "运行中"
             )
+            let validated = await validatedRunningSnapshot(from: snapshot)
+            statusSnapshots[targetKernel] = validated
+            return validated
         }
 
         if let privilegedProcess, privilegedProcess.launchPlan.kernel == targetKernel, processExists(privilegedProcess.pid) {
             let current = statusSnapshots[targetKernel]
-            return KernelStatusSnapshot(
+            let snapshot = KernelStatusSnapshot(
                 kernel: targetKernel,
                 phase: .running,
                 processIdentifier: privilegedProcess.pid,
@@ -393,6 +538,9 @@ actor KernelManager {
                 lastExitCode: nil,
                 message: current?.message ?? "运行中（管理员模式）"
             )
+            let validated = await validatedRunningSnapshot(from: snapshot)
+            statusSnapshots[targetKernel] = validated
+            return validated
         }
 
         return statusSnapshots[targetKernel] ?? .idle(for: targetKernel)
@@ -530,128 +678,31 @@ actor KernelManager {
     }
 
     private func launchPrivilegedKernel(with launchPlan: KernelLaunchPlan) async throws -> PrivilegedKernelProcess {
-        let logsRoot = try FluxBarStorageDirectories.logsRoot(fileManager: fileManager)
-        let stdoutURL = logsRoot.appendingPathComponent("\(launchPlan.kernel.rawValue)-tun.stdout.log")
-        let stderrURL = logsRoot.appendingPathComponent("\(launchPlan.kernel.rawValue)-tun.stderr.log")
-
-        fileManager.createFile(atPath: stdoutURL.path, contents: nil)
-        fileManager.createFile(atPath: stderrURL.path, contents: nil)
-
-        let command = privilegedLaunchCommand(
-            binaryURL: launchPlan.binaryURL,
-            arguments: launchPlan.arguments,
-            workingDirectoryURL: launchPlan.workingDirectoryURL,
-            stdoutURL: stdoutURL,
-            stderrURL: stderrURL
+        let portReleaseResult = await ensureConfiguredPortsReleased(
+            configurationURL: launchPlan.configurationURL,
+            expectedBinaryURL: launchPlan.binaryURL
         )
-        let output = try runAppleScriptCommand(command)
+        if portReleaseResult.isReleased == false {
+            throw KernelError.launchFailed(launchPlan.kernel, underlying: portReleaseResult.message ?? "端口占用：9090 或 7890 未释放")
+        }
 
-        guard
-            let firstLine = output
-                .split(whereSeparator: \.isNewline)
-                .map(String.init)
-                .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
-                .first(where: { $0.isEmpty == false }),
-            let pid = Int32(firstLine),
-            processExists(pid)
-        else {
-            throw TUNError.startFailed("未能获取管理员模式启动后的有效 PID")
+        let status = try await PrivilegedTUNHelperService.shared.startKernel(with: launchPlan)
+
+        guard let pid = status.pid else {
+            throw TUNError.startFailed("helper/service 未返回有效 PID")
         }
 
         return PrivilegedKernelProcess(
             pid: pid,
             launchPlan: launchPlan,
-            stdoutURL: stdoutURL,
-            stderrURL: stderrURL,
-            launchedAt: Date()
+            stdoutURL: URL(fileURLWithPath: status.stdoutPath ?? "/dev/null"),
+            stderrURL: URL(fileURLWithPath: status.stderrPath ?? "/dev/null"),
+            launchedAt: status.launchedAt ?? Date()
         )
     }
 
     private func stopPrivilegedKernel(_ privilegedProcess: PrivilegedKernelProcess) async throws {
-        let pid = privilegedProcess.pid
-
-        if processExists(pid) == false {
-            return
-        }
-
-        let command = """
-        /bin/kill -TERM \(pid) >/dev/null 2>&1 || true
-        /bin/sleep 1
-        if /bin/kill -0 \(pid) >/dev/null 2>&1; then
-          /bin/kill -KILL \(pid) >/dev/null 2>&1 || true
-        fi
-        """
-
-        _ = try runAppleScriptCommand(command)
-
-        for _ in 0..<20 where processExists(pid) {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        }
-
-        if processExists(pid) {
-            throw TUNError.stopFailed("管理员模式内核进程未能退出")
-        }
-    }
-
-    private func runAppleScriptCommand(_ shellCommand: String) throws -> String {
-        let process = Process()
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        let script = "do shell script \"\(appleScriptEscaped(shellCommand))\" with administrator privileges"
-
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            throw TUNError.privilegedOperationRequired(error.localizedDescription)
-        }
-
-        let stdout = String(decoding: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        let stderr = String(decoding: stderrPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-
-        guard process.terminationStatus == 0 else {
-            let message = stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-                : stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw TUNError.privilegedOperationRequired(message.isEmpty ? "管理员操作失败" : message)
-        }
-
-        return stdout
-    }
-
-    private func privilegedLaunchCommand(
-        binaryURL: URL,
-        arguments: [String],
-        workingDirectoryURL: URL?,
-        stdoutURL: URL,
-        stderrURL: URL
-    ) -> String {
-        let executable = shellQuoted(binaryURL.path)
-        let argumentString = arguments.map(shellQuoted).joined(separator: " ")
-        let workingDirectory = shellQuoted((workingDirectoryURL ?? binaryURL.deletingLastPathComponent()).path)
-        let stdoutPath = shellQuoted(stdoutURL.path)
-        let stderrPath = shellQuoted(stderrURL.path)
-
-        return """
-        cd \(workingDirectory)
-        \(executable)\(argumentString.isEmpty ? "" : " \(argumentString)") >> \(stdoutPath) 2>> \(stderrPath) & echo $!
-        """
-    }
-
-    private func shellQuoted(_ value: String) -> String {
-        "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
-    }
-
-    private func appleScriptEscaped(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\n", with: "\\n")
+        _ = try await PrivilegedTUNHelperService.shared.stopKernel()
     }
 
     private func processExists(_ pid: Int32) -> Bool {
@@ -664,6 +715,453 @@ actor KernelManager {
         }
 
         return errno == EPERM
+    }
+
+    private func waitForConfiguredPortsToRelease(configurationURL: URL?) async -> Bool {
+        let ports = configuredPorts(from: configurationURL)
+        guard ports.isEmpty == false else {
+            return true
+        }
+
+        for _ in 0..<40 {
+            if ports.allSatisfy({ isListeningOnPort($0) == false }) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+
+        return ports.allSatisfy { isListeningOnPort($0) == false }
+    }
+
+    private func ensureConfiguredPortsReleased(
+        configurationURL: URL?,
+        expectedBinaryURL: URL?
+    ) async -> (isReleased: Bool, message: String?) {
+        if await waitForConfiguredPortsToRelease(configurationURL: configurationURL) {
+            return (true, nil)
+        }
+
+        let ports = configuredPorts(from: configurationURL)
+        let listenersBeforeCleanup = listeningProcesses(on: ports)
+        let reclaimed = await reclaimListeningProcesses(
+            listenersBeforeCleanup,
+            expectedBinaryURL: expectedBinaryURL
+        )
+
+        if reclaimed, await waitForConfiguredPortsToRelease(configurationURL: configurationURL) {
+            return (true, nil)
+        }
+
+        let listeners = listeningProcesses(on: ports)
+        let detail = listeners.isEmpty
+            ? "端口占用：\(ports.map(String.init).joined(separator: "/")) 未释放"
+            : "端口占用：\(listeners.map { "\($0.port)(PID \($0.pid))" }.joined(separator: "，"))"
+        return (false, detail)
+    }
+
+    private func configuredPorts(from configurationURL: URL?) -> [Int] {
+        guard
+            let configurationURL,
+            let content = try? String(contentsOf: configurationURL, encoding: .utf8)
+        else {
+            return [7890, 9090]
+        }
+
+        var ports = Set<Int>()
+        ports.insert(scalarIntValue(for: "mixed-port", in: content) ?? 7890)
+
+        if let externalController = scalarStringValue(for: "external-controller", in: content),
+           let controllerPort = externalController.split(separator: ":").last.flatMap({ Int($0) }) {
+            ports.insert(controllerPort)
+        } else {
+            ports.insert(9090)
+        }
+
+        return Array(ports)
+    }
+
+    private func scalarStringValue(for key: String, in content: String) -> String? {
+        content
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { $0.hasPrefix("#") == false && $0.hasPrefix("\(key):") }
+            .map { line in
+                let rawValue = line.dropFirst(key.count + 1).trimmingCharacters(in: .whitespacesAndNewlines)
+                return rawValue.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            }
+    }
+
+    private func scalarIntValue(for key: String, in content: String) -> Int? {
+        scalarStringValue(for: key, in: content).flatMap(Int.init)
+    }
+
+    private func isListeningOnPort(_ port: Int) -> Bool {
+        if lsofReportsListening(on: port) {
+            return true
+        }
+
+        return netstatReportsListening(on: port)
+    }
+
+    private func lsofReportsListening(on port: Int) -> Bool {
+        let process = Process()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN"]
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func netstatReportsListening(on port: Int) -> Bool {
+        let process = Process()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/netstat")
+        process.arguments = ["-an", "-p", "tcp"]
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                return false
+            }
+
+            let output = String(decoding: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let targetPort = ".\(port)"
+            for line in output.split(whereSeparator: \.isNewline) {
+                let normalized = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard normalized.isEmpty == false, normalized.contains("LISTEN") else {
+                    continue
+                }
+
+                let columns = normalized.split(whereSeparator: \.isWhitespace)
+                guard columns.count >= 4 else {
+                    continue
+                }
+
+                let localAddress = String(columns[3])
+                if localAddress.hasSuffix(targetPort) || localAddress.hasSuffix(":\(port)") {
+                    return true
+                }
+            }
+        } catch {
+            return false
+        }
+
+        return false
+    }
+
+    private func listeningProcesses(on ports: [Int]) -> [ListeningProcessInfo] {
+        var results: [ListeningProcessInfo] = []
+        for port in ports {
+            let process = Process()
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
+
+            process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+            process.arguments = ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"]
+            process.standardOutput = stdoutPipe
+            process.standardError = stderrPipe
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0 else {
+                    continue
+                }
+
+                let output = String(decoding: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                let pids = output
+                    .split(whereSeparator: \.isNewline)
+                    .compactMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+
+                for pid in pids {
+                    results.append(
+                        ListeningProcessInfo(
+                            pid: pid,
+                            port: port,
+                            command: commandLine(for: pid)
+                        )
+                    )
+                }
+            } catch {
+                continue
+            }
+        }
+        return results
+    }
+
+    private func commandLine(for pid: Int32) -> String {
+        let process = Process()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-p", "\(pid)", "-o", "command="]
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return String(decoding: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            return ""
+        }
+    }
+
+    private func reclaimListeningProcesses(
+        _ listeners: [ListeningProcessInfo],
+        expectedBinaryURL: URL?
+    ) async -> Bool {
+        let reclaimable = listeners.filter { listener in
+            isReclaimableListeningProcess(listener, expectedBinaryURL: expectedBinaryURL)
+        }
+
+        guard reclaimable.isEmpty == false else {
+            return false
+        }
+
+        for listener in reclaimable {
+            await FluxBarLogService.shared.record(
+                source: .mihomo,
+                level: .warning,
+                message: "检测到残留监听进程 PID \(listener.pid) 占用 \(listener.port)，正在尝试回收"
+            )
+            _ = Darwin.kill(listener.pid, SIGTERM)
+        }
+
+        try? await Task.sleep(nanoseconds: 800_000_000)
+
+        for listener in reclaimable where processExists(listener.pid) {
+            _ = Darwin.kill(listener.pid, SIGKILL)
+        }
+
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        return true
+    }
+
+    private func isReclaimableListeningProcess(_ listener: ListeningProcessInfo, expectedBinaryURL: URL?) -> Bool {
+        let command = listener.command.lowercased()
+
+        if let expectedBinaryURL {
+            let expectedPath = expectedBinaryURL.path.lowercased()
+            if command.contains(expectedPath) {
+                return true
+            }
+        }
+
+        if command.contains("fluxbar-mihomo-runtime.yaml") || command.contains("/library/privilegedhelpertools/dev.fluxbar.tun-helper") {
+            return true
+        }
+
+        return false
+    }
+
+    private func helperBackedProcess(for kernel: KernelType) -> PrivilegedKernelProcess? {
+        guard kernel == .mihomo,
+              let status = PrivilegedTUNHelperService.readInstalledStatus(),
+              status.isRunning,
+              let pid = status.pid,
+              processExists(pid),
+              let binaryPath = status.binaryPath else {
+            return nil
+        }
+
+        let launchPlan = KernelLaunchPlan(
+            kernel: kernel,
+            binaryURL: URL(fileURLWithPath: binaryPath),
+            configurationURL: status.configurationPath.map(URL.init(fileURLWithPath:)),
+            workingDirectoryURL: status.workingDirectoryPath.map(URL.init(fileURLWithPath:)),
+            arguments: [],
+            environment: [:]
+        )
+
+        return PrivilegedKernelProcess(
+            pid: pid,
+            launchPlan: launchPlan,
+            stdoutURL: URL(fileURLWithPath: status.stdoutPath ?? "/dev/null"),
+            stderrURL: URL(fileURLWithPath: status.stderrPath ?? "/dev/null"),
+            launchedAt: status.launchedAt ?? Date()
+        )
+    }
+
+    private func validatedRunningSnapshot(from snapshot: KernelStatusSnapshot, forceRefresh: Bool = false) async -> KernelStatusSnapshot {
+        guard snapshot.phase == .running, snapshot.kernel == .mihomo else {
+            return snapshot
+        }
+
+        guard let configurationURL = snapshot.configurationURL else {
+            return snapshot
+        }
+
+        let health = await controllerHealth(
+            for: snapshot.kernel,
+            configurationURL: configurationURL,
+            processIdentifier: snapshot.processIdentifier,
+            forceRefresh: forceRefresh
+        )
+        guard health.isReachable else {
+            if let processIdentifier = snapshot.processIdentifier, processExists(processIdentifier) {
+                return KernelStatusSnapshot(
+                    kernel: snapshot.kernel,
+                    phase: .running,
+                    processIdentifier: snapshot.processIdentifier,
+                    binaryURL: snapshot.binaryURL,
+                    configurationURL: snapshot.configurationURL,
+                    launchedAt: snapshot.launchedAt,
+                    lastExitCode: snapshot.lastExitCode,
+                    message: degradedRunningMessage(configurationURL: configurationURL, underlying: health.message)
+                )
+            }
+
+            return KernelStatusSnapshot(
+                kernel: snapshot.kernel,
+                phase: .failed,
+                processIdentifier: snapshot.processIdentifier,
+                binaryURL: snapshot.binaryURL,
+                configurationURL: snapshot.configurationURL,
+                launchedAt: snapshot.launchedAt,
+                lastExitCode: snapshot.lastExitCode,
+                message: health.message ?? "controller 不可用"
+            )
+        }
+
+        return KernelStatusSnapshot(
+            kernel: snapshot.kernel,
+            phase: .running,
+            processIdentifier: snapshot.processIdentifier,
+            binaryURL: snapshot.binaryURL,
+            configurationURL: snapshot.configurationURL,
+            launchedAt: snapshot.launchedAt,
+            lastExitCode: snapshot.lastExitCode,
+            message: health.message ?? snapshot.message
+        )
+    }
+
+    private func degradedRunningMessage(configurationURL: URL, underlying: String?) -> String {
+        let runtimeConfiguration = RuntimeConfigurationInspector.inspect(configurationURL: configurationURL)
+        let baseMessage = runtimeConfiguration.tun.enabled ? "运行中（TUN，Controller 初始化中）" : "运行中（Controller 初始化中）"
+        guard let underlying, underlying.isEmpty == false else {
+            return baseMessage
+        }
+        return "\(baseMessage)：\(underlying)"
+    }
+
+    private func controllerHealth(
+        for kernel: KernelType,
+        configurationURL: URL,
+        processIdentifier: Int32?,
+        forceRefresh: Bool = false
+    ) async -> (isReachable: Bool, message: String?) {
+        if forceRefresh == false,
+           let cache = controllerHealthCache[kernel],
+           Date().timeIntervalSince(cache.checkedAt) < 1 {
+            return (cache.isReachable, cache.message)
+        }
+
+        guard let context = FluxBarConfigurationSupport.controllerContext(from: configurationURL) else {
+            let message = "Controller 未配置"
+            controllerHealthCache[kernel] = (Date(), false, message)
+            return (false, message)
+        }
+
+        let runtimeConfiguration = RuntimeConfigurationInspector.inspect(configurationURL: configurationURL)
+        let maxAttempts: Int
+        let retryDelayNanoseconds: UInt64
+        if runtimeConfiguration.tun.enabled {
+            maxAttempts = forceRefresh ? 8 : 1
+            retryDelayNanoseconds = 250_000_000
+        } else {
+            maxAttempts = forceRefresh ? 3 : 1
+            retryDelayNanoseconds = 120_000_000
+        }
+        let client = MihomoControllerClient(configuration: context.configuration)
+
+        var lastError: Error?
+        for attempt in 1...maxAttempts {
+            do {
+                _ = try await client.fetchVersion()
+                let message = snapshotMessageForReachableController(configurationURL: configurationURL)
+                controllerHealthCache[kernel] = (Date(), true, message)
+                return (true, message)
+            } catch {
+                lastError = error
+
+                guard attempt < maxAttempts, Task.isCancelled == false else {
+                    break
+                }
+
+                try? await Task.sleep(nanoseconds: retryDelayNanoseconds)
+            }
+        }
+
+        let message = controllerFailureMessage(
+            configurationURL: configurationURL,
+            processIdentifier: processIdentifier,
+            underlying: lastError?.localizedDescription ?? "未知错误"
+        )
+        controllerHealthCache[kernel] = (Date(), false, message)
+        return (false, message)
+    }
+
+    private func snapshotMessageForReachableController(configurationURL: URL) -> String {
+        let runtimeConfiguration = RuntimeConfigurationInspector.inspect(configurationURL: configurationURL)
+        return runtimeConfiguration.tun.enabled ? "运行中（TUN）" : "运行中"
+    }
+
+    private func controllerFailureMessage(configurationURL: URL, processIdentifier: Int32?, underlying: String) -> String {
+        let runtimeConfiguration = RuntimeConfigurationInspector.inspect(configurationURL: configurationURL)
+        let stderrHint = currentFailureHint(for: processIdentifier, configurationURL: configurationURL)
+        let combined = [underlying, stderrHint].compactMap { $0 }.joined(separator: " | ")
+
+        if combined.localizedCaseInsensitiveContains("address already in use") || combined.localizedCaseInsensitiveContains("bind:") {
+            return "端口占用：请检查 9090 或 7890 是否已被其他进程占用"
+        }
+
+        if combined.localizedCaseInsensitiveContains("operation not permitted") {
+            return runtimeConfiguration.tun.enabled ? "TUN 启动失败：缺少系统权限或 helper/service 未正确接管" : "内核启动失败：权限不足"
+        }
+
+        if combined.localizedCaseInsensitiveContains("parse config error") {
+            return "运行配置无效：\(combined)"
+        }
+
+        return "Controller 不可达：\(combined)"
+    }
+
+    private func currentFailureHint(for processIdentifier: Int32?, configurationURL: URL?) -> String? {
+        guard let kernel = configurationURL.flatMap({ _ in KernelType.mihomo }) else {
+            return nil
+        }
+
+        let outputHint = (recentOutput[kernel] ?? []).suffix(3).joined(separator: " | ")
+        if outputHint.isEmpty == false {
+            return outputHint
+        }
+
+        if let privilegedProcess, privilegedProcess.pid == processIdentifier {
+            let stderrText = (try? String(contentsOf: privilegedProcess.stderrURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let stderrText, stderrText.isEmpty == false {
+                return stderrText
+            }
+        }
+
+        return nil
     }
 
     private func launchError(for kernel: KernelType, underlying: String) -> KernelError {

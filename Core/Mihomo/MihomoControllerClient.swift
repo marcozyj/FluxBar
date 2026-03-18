@@ -100,6 +100,46 @@ actor MihomoControllerClient {
         return try Self.decodeTraffic(from: data, path: "/traffic")
     }
 
+    func patchTunConfiguration(
+        enabled: Bool,
+        stack: String?,
+        autoRoute: Bool?,
+        autoDetectInterface: Bool?,
+        strictRoute: Bool?,
+        dnsHijack: [String]?,
+        enableDNS: Bool?
+    ) async throws {
+        var tunBody: [String: Any] = ["enable": enabled]
+
+        if let stack, stack.isEmpty == false {
+            tunBody["stack"] = stack
+        }
+        if let autoRoute {
+            tunBody["auto-route"] = autoRoute
+        }
+        if let autoDetectInterface {
+            tunBody["auto-detect-interface"] = autoDetectInterface
+        }
+        if let strictRoute {
+            tunBody["strict-route"] = strictRoute
+        }
+        if let dnsHijack {
+            tunBody["dns-hijack"] = dnsHijack
+        }
+
+        var body: [String: Any] = ["tun": tunBody]
+        if let enableDNS {
+            body["dns"] = ["enable": enableDNS]
+        }
+
+        try await patchConfigs(body: body)
+    }
+
+    func fetchRuntimeTunEnabled() async throws -> Bool? {
+        let data = try await data(for: "/configs")
+        return try Self.decodeRuntimeTunEnabled(from: data, path: "/configs")
+    }
+
     func fetchLiveTrafficSnapshot(timeoutNanoseconds: UInt64 = 1_500_000_000) async throws -> MihomoTrafficSnapshot {
         let stream = try streamTraffic()
 
@@ -257,6 +297,15 @@ actor MihomoControllerClient {
         }
 
         return data
+    }
+
+    private func patchConfigs(body: [String: Any]) async throws {
+        guard JSONSerialization.isValidJSONObject(body) else {
+            throw MihomoControllerError.malformedPayload(path: "/configs")
+        }
+
+        let payload = try JSONSerialization.data(withJSONObject: body)
+        _ = try await data(for: "/configs", method: "PATCH", body: payload)
     }
 
     private func request(
@@ -520,6 +569,19 @@ actor MihomoControllerClient {
         let payload = stringValue(dictionary["payload"]) ?? stringValue(dictionary["message"]) ?? ""
 
         return MihomoLogEntry(level: level, payload: payload)
+    }
+
+    private nonisolated static func decodeRuntimeTunEnabled(from data: Data, path: String) throws -> Bool? {
+        let object = try jsonObject(from: data, path: path)
+        guard let dictionary = object as? [String: Any] else {
+            throw MihomoControllerError.malformedPayload(path: path)
+        }
+
+        if let tun = dictionary["tun"] as? [String: Any] {
+            return boolValue(tun["enable"])
+        }
+
+        return boolValue(dictionary["tun"])
     }
 
     private nonisolated static func proxyGroup(from dictionary: [String: Any]) -> MihomoProxyGroup? {

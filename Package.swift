@@ -8,7 +8,8 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
-        .executable(name: "FluxBar", targets: ["FluxBar"])
+        .executable(name: "FluxBar", targets: ["FluxBar"]),
+        .executable(name: "FluxBarTUNHelper", targets: ["FluxBarTUNHelper"])
     ],
     targets: [
         .executableTarget(
@@ -21,8 +22,10 @@ let package = Package(
                 "Assets.xcassets",
                 "BuildArtifacts",
                 "FluxBar.entitlements",
+                "test",
                 "Resources",
                 "Scripts",
+                "Helper",
                 "README.md",
                 "CHANGELOG.md"
             ],
@@ -36,6 +39,10 @@ let package = Package(
                 "Support",
                 "UI"
             ]
+        ),
+        .executableTarget(
+            name: "FluxBarTUNHelper",
+            path: "Helper"
         )
     ]
 )

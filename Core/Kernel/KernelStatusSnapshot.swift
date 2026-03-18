@@ -22,6 +22,10 @@ struct KernelStatusSnapshot: Sendable {
         phase == .running
     }
 
+    nonisolated var isTransitioning: Bool {
+        phase == .starting || phase == .stopping
+    }
+
     nonisolated static func idle(for kernel: KernelType, message: String? = nil) -> KernelStatusSnapshot {
         KernelStatusSnapshot(
             kernel: kernel,

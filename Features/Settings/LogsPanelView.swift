@@ -45,7 +45,7 @@ struct LogsPanelView: View {
         }
         .frame(minHeight: 560, alignment: .top)
         .task {
-            await startRefreshLoop()
+            await startLogSubscriptionLoop()
         }
     }
 
@@ -253,17 +253,18 @@ struct LogsPanelView: View {
         }
     }
 
-    private func startRefreshLoop() async {
-        await loadLogs()
-
-        while Task.isCancelled == false {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-
+    private func startLogSubscriptionLoop() async {
+        let stream = await FluxBarLogService.shared.stream(limit: 400)
+        for await latestEntries in stream {
             if Task.isCancelled {
                 break
             }
 
-            await loadLogs(showBusyState: false)
+            await MainActor.run {
+                entries = latestEntries
+                lastUpdatedAt = Date()
+                isRefreshing = false
+            }
         }
     }
 
